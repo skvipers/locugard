@@ -1,0 +1,34 @@
+# Python & environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets, certificates, databases, logs (NEVER commit)
+*.key
+*.crt
+*.pem
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.jsonl
+*.env
+secrets/
+data/
+backups/
+
+# Local experiments, pilot data & internal root project notes
+/pilot/
+/spike/
+/AGENTS.md
+/CHEATSHEET.md
+/concept.md
+/REQUIREMENTS.md
+/DOMAIN-MODEL.md
+/THREAT-MODEL.md
+/VERIFICATION.md
+/INTEGRATION-PLAN.md
+/OPERATIONS.md
