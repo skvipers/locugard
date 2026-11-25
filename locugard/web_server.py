@@ -10,7 +10,7 @@ from typing import Any
 from .auth_channels import AuthChannels
 from .auth_permissions import AuthPermissionsBridge
 from .auth_service import AuthError, AuthService, extract_client_ip
-from .web_ui import render_web_ui
+from .web_ui import render_web_ui, resolve_ui_lang
 
 SESSION_COOKIE = "__Host-locugard_sid"
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
@@ -545,7 +545,8 @@ def create_web_app(
         )
 
     async def web_ui_index(req: Request) -> HTMLResponse:
-        return HTMLResponse(render_web_ui())
+        lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
+        return HTMLResponse(render_web_ui(lang=lang))
 
     async def web_ui_asset(req: Request) -> Response:
         name = req.path_params.get("filename", "favicon.ico")

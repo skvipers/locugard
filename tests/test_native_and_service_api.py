@@ -118,13 +118,17 @@ class TestNativeAndServiceContract(unittest.TestCase):
 
             ssl_ctx = ssl.create_default_context(cafile=str(ca_crt))
             try:
-                # 1. Built-in Web UI (GET /) + brand assets with security headers and zero localStorage token usage
-                st, ui_res, ui_hdrs = _https_json(f"{origin}/", ctx=ssl_ctx)
+                # 1. Built-in Web UI (GET /) + i18n (EN/RU) + brand assets with security headers and zero localStorage token usage
+                st, ui_res, ui_hdrs = _https_json(f"{origin}/", headers={"Accept-Language": "en-US,en;q=0.9"}, ctx=ssl_ctx)
                 self.assertEqual(st, 200)
-                self.assertIn("LocuGard", ui_res["raw"])
+                self.assertIn('<html lang="en">', ui_res["raw"])
                 self.assertIn("/assets/favicon.svg", ui_res["raw"])
                 self.assertNotIn("localStorage.setItem", ui_res["raw"])
                 self.assertEqual(ui_hdrs.get("x-frame-options") or ui_hdrs.get("X-Frame-Options"), "DENY")
+
+                st_ru, ui_ru, _ = _https_json(f"{origin}/?lang=ru", ctx=ssl_ctx)
+                self.assertEqual(st_ru, 200)
+                self.assertIn('<html lang="ru">', ui_ru["raw"])
 
                 st_ico, _, ico_hdrs = _https_json(f"{origin}/assets/favicon.svg", ctx=ssl_ctx)
                 self.assertEqual(st_ico, 200)
