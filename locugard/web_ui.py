@@ -179,6 +179,9 @@ WEB_UI_HTML = """<!doctype html>
       </div>
       <p class="sub" data-i18n="login_sub"></p>
       <button class="primary" id="btnLogin" onclick="doLogin()" data-i18n="btn_sign_in"></button>
+      <p class="sub" style="margin-top:14px;margin-bottom:0;font-size:13px">
+        <a href="/enroll" style="color:var(--accent-soft);text-decoration:none;font-weight:600" data-i18n="link_enroll_device"></a>
+      </p>
       <p class="sub hidden" style="margin-top:12px;font-size:12px;color:var(--warning)" id="secHint"></p>
     </div>
 
@@ -245,6 +248,7 @@ WEB_UI_HTML = """<!doctype html>
             <div class="codebox" id="enrollBox"></div>
             <div class="row" style="margin-top:8px">
               <button onclick="copyText(document.getElementById('enrollBox').textContent)" data-i18n="btn_copy_json"></button>
+              <button onclick="copyEnrollLink()" data-i18n="btn_copy_enroll_link"></button>
             </div>
           </div>
         </div>
@@ -314,6 +318,7 @@ WEB_UI_HTML = """<!doctype html>
         page_title: "LocuGard — Управление доступом",
         login_sub: "Используйте Passkey, биометрию или ключ безопасности.",
         btn_sign_in: "Войти",
+        link_enroll_device: "Привязать новое устройство по коду →",
         https_required: "Для входа по Passkey требуется HTTPS.",
         hdr_device: "Устройство",
         mode_prefix: "Режим",
@@ -350,6 +355,7 @@ WEB_UI_HTML = """<!doctype html>
         enroll_target_ph: "account_id (пусто = текущий аккаунт)",
         btn_create_enroll: "Создать код регистрации",
         btn_copy_json: "Скопировать JSON",
+        btn_copy_enroll_link: "Скопировать ссылку /enroll",
         pending_title: "Ожидающие заявки на регистрацию",
         pending_sub: "Сверьте отпечаток ключа (key_fingerprint) перед одобрением.",
         pending_empty: "Ожидающих заявок нет",
@@ -411,6 +417,7 @@ WEB_UI_HTML = """<!doctype html>
         page_title: "LocuGard — Access Control",
         login_sub: "Use your Passkey, biometrics, or security key.",
         btn_sign_in: "Sign in",
+        link_enroll_device: "Enroll a new device with a code →",
         https_required: "HTTPS is required for Passkey sign-in.",
         hdr_device: "Device",
         mode_prefix: "Mode",
@@ -447,6 +454,7 @@ WEB_UI_HTML = """<!doctype html>
         enroll_target_ph: "account_id (empty = current account)",
         btn_create_enroll: "Create Enrollment Code",
         btn_copy_json: "Copy JSON",
+        btn_copy_enroll_link: "Copy /enroll Link",
         pending_title: "Pending Registrations",
         pending_sub: "Verify the key fingerprint before approving.",
         pending_empty: "No pending registrations",
@@ -519,6 +527,7 @@ WEB_UI_HTML = """<!doctype html>
     let csrf = "";
     let profile = null;
     let lastApproval = null;
+    let lastEnrollment = null;
     let lastRecoveryCodes = [];
     let activeTab = "session";
 
@@ -738,6 +747,7 @@ WEB_UI_HTML = """<!doctype html>
           method: "POST",
           body: JSON.stringify(target ? { target_account_id: target } : {})
         });
+        lastEnrollment = data;
         $("enrollBox").textContent = JSON.stringify({
           origin: window.location.origin,
           enrollment_id: data.enrollment_id,
@@ -750,6 +760,12 @@ WEB_UI_HTML = """<!doctype html>
       } catch (e) {
         toast(t("t_enroll_err") + ": " + trErr(e.message), "err");
       }
+    }
+
+    function copyEnrollLink() {
+      if (!lastEnrollment) return;
+      const hash = new URLSearchParams({ enrollment_id: lastEnrollment.enrollment_id, secret: lastEnrollment.secret }).toString();
+      copyText(window.location.origin + "/enroll#" + hash);
     }
 
     async function loadPending() {
@@ -867,3 +883,428 @@ def resolve_ui_lang(query_lang: str | None = None, accept_language: str | None =
 def render_web_ui(lang: str = "en") -> str:
     resolved = "ru" if (lang or "").lower().startswith("ru") else "en"
     return WEB_UI_HTML.replace("__LOCUGARD_LANG__", resolved)
+
+
+BOOTSTRAP_UI_HTML = """<!doctype html>
+<html lang="__LOCUGARD_LANG__">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LocuGard — Bootstrap</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
+  <style>
+    :root {
+      color-scheme: dark light;
+      --bg: #0c0f14; --surface: #141923; --surface-2: #1b2230;
+      --border: rgba(255,255,255,0.09); --text: #edf1f7; --muted: #94a3b8;
+      --accent: #0f766e; --accent-hover: #0d9488; --accent-soft: #2dd4bf;
+      --success: #22c55e; --warning: #f59e0b; --danger: #ef4444;
+      --radius: 12px; --shadow: 0 12px 32px rgba(0,0,0,0.35);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6fa; --surface: #ffffff; --surface-2: #f8fafc;
+        --border: rgba(15,23,42,0.1); --text: #0f172a; --muted: #475569;
+        --accent-soft: #0f766e; --shadow: 0 8px 24px rgba(15,23,42,0.08);
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--sans); background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh; }
+    .wrap { max-width: 560px; margin: 44px auto; padding: 0 20px 64px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow); position: relative; }
+    .top-lang { position: absolute; top: 14px; right: 14px; display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface-2); }
+    .top-lang button { border: 0; border-radius: 0; padding: 5px 9px; font-size: 12px; background: transparent; color: var(--muted); cursor: pointer; font-weight: 600; }
+    .top-lang button.active { background: var(--accent); color: #fff; }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+    .brand img { width: 40px; height: 40px; border-radius: 10px; }
+    .brand h1 { margin: 0; font-size: 19px; }
+    .sub { color: var(--muted); font-size: 13.5px; margin: 0 0 16px; }
+    label.fld { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; font-weight: 600; }
+    input { font: inherit; font-size: 14px; padding: 9px 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); width: 100%; }
+    input:focus { outline: 2px solid rgba(15,118,110,0.5); outline-offset: 1px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+    button.btn { font: inherit; font-size: 13.5px; font-weight: 600; padding: 9px 14px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; }
+    button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.btn.primary:hover { background: var(--accent-hover); }
+    .codebox { font-family: var(--mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; padding: 12px; word-break: break-all; white-space: pre-wrap; max-height: 220px; overflow: auto; margin-top: 14px; }
+    .hidden { display: none !important; }
+    .msg { margin-top: 12px; font-size: 13px; }
+    .msg.ok { color: var(--success); }
+    .msg.err { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top-lang">
+        <button data-lang="ru" onclick="setLang('ru')">RU</button>
+        <button data-lang="en" onclick="setLang('en')">EN</button>
+      </div>
+      <div class="brand">
+        <img src="/assets/favicon.svg" alt="LocuGard" />
+        <h1 data-i18n="title"></h1>
+      </div>
+      <p class="sub" data-i18n="sub"></p>
+
+      <label class="fld" data-i18n="lbl_name"></label>
+      <input id="ownerName" value="Owner" />
+
+      <label class="fld" data-i18n="lbl_chal"></label>
+      <input id="bootChal" data-i18n-placeholder="ph_chal" />
+
+      <div class="row">
+        <button class="btn primary" onclick="createBootKey()" data-i18n="btn_create"></button>
+        <a href="/" style="color:var(--accent-soft);font-size:13px;text-decoration:none;margin-left:auto" data-i18n="back_login"></a>
+      </div>
+
+      <div id="outWrap" class="hidden">
+        <div class="codebox" id="outJson"></div>
+        <div class="row">
+          <button class="btn" onclick="copyOut()" data-i18n="btn_copy"></button>
+          <button class="btn" onclick="downloadOut()" data-i18n="btn_download"></button>
+        </div>
+        <p class="sub" style="margin-top:12px;margin-bottom:0" data-i18n="next_step"></p>
+      </div>
+      <div id="statusMsg" class="msg"></div>
+    </div>
+  </div>
+  <script>
+    const I18N = {
+      ru: {
+        title: "Инициализация первого владельца",
+        sub: "Эта страница только создаёт Passkey в браузере по challenge из локальной консоли (auth_cli bootstrap-begin). После активации владельца она автоматически закрывается.",
+        lbl_name: "Имя владельца (метка Passkey)",
+        lbl_chal: "Challenge (из auth_cli bootstrap-begin)",
+        ph_chal: "Вставьте значение options.challenge",
+        btn_create: "Создать Passkey",
+        back_login: "← Ко входу",
+        btn_copy: "Скопировать JSON",
+        btn_download: "Скачать cred.json",
+        next_step: "Передайте cred.json в локальную консоль: python -m locugard.auth_cli ... bootstrap-complete --credential-json cred.json",
+        err_empty: "Вставьте options.challenge из вывода bootstrap-begin.",
+        ok_created: "Ключ создан. Сохраните cred.json и завершите регистрацию в консоли.",
+        ok_copied: "JSON скопирован в буфер обмена."
+      },
+      en: {
+        title: "First-Owner Bootstrap",
+        sub: "This helper only creates a browser Passkey using the challenge printed by local console (auth_cli bootstrap-begin). It closes automatically once the first owner is active.",
+        lbl_name: "Owner Name (Passkey label)",
+        lbl_chal: "Challenge (from auth_cli bootstrap-begin)",
+        ph_chal: "Paste options.challenge value",
+        btn_create: "Create Passkey",
+        back_login: "← Sign in",
+        btn_copy: "Copy JSON",
+        btn_download: "Download cred.json",
+        next_step: "Pass cred.json to local console: python -m locugard.auth_cli ... bootstrap-complete --credential-json cred.json",
+        err_empty: "Paste options.challenge from bootstrap-begin output.",
+        ok_created: "Passkey created. Save cred.json and finish in local console.",
+        ok_copied: "JSON copied to clipboard."
+      }
+    };
+    let lang = (new URLSearchParams(location.search).get("lang") || document.documentElement.lang || "en").toLowerCase().startsWith("ru") ? "ru" : "en";
+    let lastJson = "";
+    const $ = id => document.getElementById(id);
+    const t = k => I18N[lang][k] || I18N.en[k] || k;
+    const b64uToBuf = s => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+    const bufToB64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+
+    function applyI18n() {
+      document.documentElement.lang = lang;
+      document.querySelectorAll("[data-i18n]").forEach(el => el.textContent = t(el.dataset.i18n));
+      document.querySelectorAll("[data-i18n-placeholder]").forEach(el => el.placeholder = t(el.dataset.i18nPlaceholder));
+      document.querySelectorAll(".top-lang button").forEach(b => b.classList.toggle("active", b.dataset.lang === lang));
+    }
+    function setLang(l) {
+      lang = l;
+      const u = new URL(location.href); u.searchParams.set("lang", l); history.replaceState({}, "", u.toString());
+      applyI18n();
+    }
+    function setMsg(text, kind) { const el = $("statusMsg"); el.textContent = text; el.className = "msg " + kind; }
+
+    async function createBootKey() {
+      const chal = $("bootChal").value.trim();
+      const name = $("ownerName").value.trim() || "Owner";
+      if (!chal) return setMsg(t("err_empty"), "err");
+      try {
+        const cred = await navigator.credentials.create({
+          publicKey: {
+            challenge: b64uToBuf(chal),
+            rp: { name: "LocuGard", id: location.hostname },
+            user: { id: new TextEncoder().encode("owner_bootstrap"), name, displayName: name },
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+            authenticatorSelection: { userVerification: "required" },
+            timeout: 60000
+          }
+        });
+        lastJson = JSON.stringify({
+          id: cred.id, rawId: bufToB64u(cred.rawId), type: cred.type,
+          response: {
+            attestationObject: bufToB64u(cred.response.attestationObject),
+            clientDataJSON: bufToB64u(cred.response.clientDataJSON)
+          }
+        }, null, 2);
+        $("outJson").textContent = lastJson;
+        $("outWrap").classList.remove("hidden");
+        setMsg(t("ok_created"), "ok");
+      } catch (e) {
+        setMsg(e.message || String(e), "err");
+      }
+    }
+    function copyOut() { navigator.clipboard.writeText(lastJson).then(() => setMsg(t("ok_copied"), "ok")); }
+    function downloadOut() {
+      const blob = new Blob([lastJson + "\\n"], { type: "application/json;charset=utf-8" });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "cred.json"; a.click(); URL.revokeObjectURL(a.href);
+    }
+    applyI18n();
+  </script>
+</body>
+</html>
+"""
+
+
+ENROLL_UI_HTML = """<!doctype html>
+<html lang="__LOCUGARD_LANG__">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LocuGard — Enroll Device</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
+  <style>
+    :root {
+      color-scheme: dark light;
+      --bg: #0c0f14; --surface: #141923; --surface-2: #1b2230;
+      --border: rgba(255,255,255,0.09); --text: #edf1f7; --muted: #94a3b8;
+      --accent: #0f766e; --accent-hover: #0d9488; --accent-soft: #2dd4bf;
+      --success: #22c55e; --warning: #f59e0b; --danger: #ef4444;
+      --radius: 12px; --shadow: 0 12px 32px rgba(0,0,0,0.35);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f4f6fa; --surface: #ffffff; --surface-2: #f8fafc;
+        --border: rgba(15,23,42,0.1); --text: #0f172a; --muted: #475569;
+        --accent-soft: #0f766e; --shadow: 0 8px 24px rgba(15,23,42,0.08);
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--sans); background: var(--bg); color: var(--text); line-height: 1.5; min-height: 100vh; }
+    .wrap { max-width: 520px; margin: 44px auto; padding: 0 20px 64px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; box-shadow: var(--shadow); position: relative; }
+    .top-lang { position: absolute; top: 14px; right: 14px; display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface-2); }
+    .top-lang button { border: 0; border-radius: 0; padding: 5px 9px; font-size: 12px; background: transparent; color: var(--muted); cursor: pointer; font-weight: 600; }
+    .top-lang button.active { background: var(--accent); color: #fff; }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+    .brand img { width: 40px; height: 40px; border-radius: 10px; }
+    .brand h1 { margin: 0; font-size: 19px; }
+    .sub { color: var(--muted); font-size: 13.5px; margin: 0 0 16px; }
+    label.fld { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; font-weight: 600; }
+    input, textarea { font: inherit; font-size: 14px; padding: 9px 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); width: 100%; }
+    textarea { font-family: var(--mono); font-size: 12px; min-height: 68px; resize: vertical; }
+    input:focus, textarea:focus { outline: 2px solid rgba(15,118,110,0.5); outline-offset: 1px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; align-items: center; }
+    button.btn { font: inherit; font-size: 13.5px; font-weight: 600; padding: 9px 15px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; }
+    button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.btn.primary:hover { background: var(--accent-hover); }
+    .kv { background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-top: 10px; }
+    .kv label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .kv .val { font-family: var(--mono); font-size: 13px; margin-top: 2px; word-break: break-all; }
+    .hidden { display: none !important; }
+    .msg { margin-top: 12px; font-size: 13px; }
+    .msg.ok { color: var(--success); }
+    .msg.err { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top-lang">
+        <button data-lang="ru" onclick="setLang('ru')">RU</button>
+        <button data-lang="en" onclick="setLang('en')">EN</button>
+      </div>
+      <div class="brand">
+        <img src="/assets/favicon.svg" alt="LocuGard" />
+        <h1 data-i18n="title"></h1>
+      </div>
+      <p class="sub" data-i18n="sub"></p>
+
+      <div id="formWrap">
+        <label class="fld" data-i18n="lbl_paste_json"></label>
+        <textarea id="pasteJson" data-i18n-placeholder="ph_paste_json" oninput="tryParseJson()"></textarea>
+
+        <label class="fld" data-i18n="lbl_enr_id"></label>
+        <input id="enrId" placeholder="enr_..." />
+
+        <label class="fld" data-i18n="lbl_secret"></label>
+        <input id="enrSecret" type="password" autocomplete="one-time-code" />
+
+        <label class="fld" data-i18n="lbl_dev_name"></label>
+        <input id="devName" data-i18n-placeholder="ph_dev_name" />
+
+        <div class="row">
+          <button class="btn primary" onclick="doEnroll()" data-i18n="btn_enroll"></button>
+          <a href="/" style="color:var(--accent-soft);font-size:13px;text-decoration:none;margin-left:auto" data-i18n="back_login"></a>
+        </div>
+      </div>
+
+      <div id="doneWrap" class="hidden">
+        <p class="sub" style="color:var(--success);font-weight:600" data-i18n="done_title"></p>
+        <div class="kv"><label>Request ID</label><div class="val" id="resReqId"></div></div>
+        <div class="kv"><label>Device ID</label><div class="val" id="resDevId"></div></div>
+        <div class="kv"><label data-i18n="lbl_fp"></label><div class="val" id="resFp"></div></div>
+        <p class="sub" style="margin-top:14px" data-i18n="done_hint"></p>
+        <div class="row">
+          <a href="/" class="btn primary" style="text-decoration:none" data-i18n="go_login"></a>
+        </div>
+      </div>
+
+      <div id="statusMsg" class="msg"></div>
+    </div>
+  </div>
+  <script>
+    const I18N = {
+      ru: {
+        title: "Привязка нового устройства",
+        sub: "Введите одноразовый код регистрации от владельца. После создания Passkey владелец должен одобрить заявку.",
+        lbl_paste_json: "Быстрая вставка JSON (необязательно)",
+        ph_paste_json: '{"enrollment_id": "...", "secret": "..."}',
+        lbl_enr_id: "Enrollment ID",
+        lbl_secret: "Одноразовый секрет",
+        lbl_dev_name: "Название этого устройства",
+        ph_dev_name: "Например: Ноутбук (Edge)",
+        btn_enroll: "Зарегистрировать устройство",
+        back_login: "← Ко входу",
+        done_title: "Заявка отправлена и ожидает одобрения владельцем",
+        lbl_fp: "Отпечаток ключа (сверьте с владельцем)",
+        done_hint: "После одобрения на доверенном устройстве вы сможете войти по созданному Passkey.",
+        go_login: "Перейти ко входу",
+        err_fields: "Укажите Enrollment ID и одноразовый секрет."
+      },
+      en: {
+        title: "Enroll New Device",
+        sub: "Enter the one-time enrollment code issued by the owner. After creating a Passkey, the owner must approve the request.",
+        lbl_paste_json: "Quick JSON Paste (optional)",
+        ph_paste_json: '{"enrollment_id": "...", "secret": "..."}',
+        lbl_enr_id: "Enrollment ID",
+        lbl_secret: "One-time Secret",
+        lbl_dev_name: "Device Name",
+        ph_dev_name: "e.g., Work Laptop (Chrome)",
+        btn_enroll: "Enroll Device",
+        back_login: "← Sign in",
+        done_title: "Request submitted — awaiting owner approval",
+        lbl_fp: "Key Fingerprint (verify with owner)",
+        done_hint: "Once approved on a trusted device, you can sign in with this Passkey.",
+        go_login: "Go to Sign In",
+        err_fields: "Enter both Enrollment ID and one-time secret."
+      }
+    };
+    let lang = (new URLSearchParams(location.search).get("lang") || document.documentElement.lang || "en").toLowerCase().startsWith("ru") ? "ru" : "en";
+    const $ = id => document.getElementById(id);
+    const t = k => I18N[lang][k] || I18N.en[k] || k;
+    const b64uToBuf = s => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+    const bufToB64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+
+    function applyI18n() {
+      document.documentElement.lang = lang;
+      document.querySelectorAll("[data-i18n]").forEach(el => el.textContent = t(el.dataset.i18n));
+      document.querySelectorAll("[data-i18n-placeholder]").forEach(el => el.placeholder = t(el.dataset.i18nPlaceholder));
+      document.querySelectorAll(".top-lang button").forEach(b => b.classList.toggle("active", b.dataset.lang === lang));
+    }
+    function setLang(l) {
+      lang = l;
+      const u = new URL(location.href); u.searchParams.set("lang", l); history.replaceState({}, "", u.toString());
+      applyI18n();
+    }
+    function setMsg(text, kind) { const el = $("statusMsg"); el.textContent = text; el.className = "msg " + kind; }
+
+    function tryParseJson() {
+      const raw = $("pasteJson").value.trim();
+      if (!raw.startsWith("{")) return;
+      try {
+        const obj = JSON.parse(raw);
+        if (obj.enrollment_id) $("enrId").value = obj.enrollment_id;
+        if (obj.secret) $("enrSecret").value = obj.secret;
+      } catch {}
+    }
+
+    function readHashParams() {
+      if (!location.hash || location.hash.length < 2) return;
+      const p = new URLSearchParams(location.hash.slice(1));
+      if (p.get("enrollment_id")) $("enrId").value = p.get("enrollment_id");
+      if (p.get("secret")) $("enrSecret").value = p.get("secret");
+      // Сразу очищаем фрагмент из адресной строки, чтобы секрет не висел в истории
+      history.replaceState({}, "", location.pathname + location.search);
+    }
+
+    async function doEnroll() {
+      const enrollment_id = $("enrId").value.trim();
+      const secret = $("enrSecret").value.trim();
+      const device_name = $("devName").value.trim() || "Browser Device";
+      if (!enrollment_id || !secret) return setMsg(t("err_fields"), "err");
+      setMsg("", "");
+      try {
+        const r1 = await fetch("/auth/register/options", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enrollment_id, secret })
+        });
+        const d1 = await r1.json().catch(() => ({}));
+        if (!r1.ok) throw new Error(d1.error || ("HTTP " + r1.status));
+
+        const opts = d1.options;
+        opts.challenge = b64uToBuf(opts.challenge);
+        if (opts.user && typeof opts.user.id === "string") opts.user.id = b64uToBuf(opts.user.id);
+        if (opts.excludeCredentials) opts.excludeCredentials = opts.excludeCredentials.map(c => ({ ...c, id: b64uToBuf(c.id) }));
+
+        const cred = await navigator.credentials.create({ publicKey: opts });
+        const r2 = await fetch("/auth/register/submit", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            enrollment_id,
+            secret,
+            challenge_id: d1.challenge_id,
+            device_name,
+            requested_role: d1.allowed_role || "member",
+            credential: {
+              id: cred.id, rawId: bufToB64u(cred.rawId), type: cred.type,
+              response: {
+                attestationObject: bufToB64u(cred.response.attestationObject),
+                clientDataJSON: bufToB64u(cred.response.clientDataJSON)
+              }
+            }
+          })
+        });
+        const d2 = await r2.json().catch(() => ({}));
+        if (!r2.ok) throw new Error(d2.error || ("HTTP " + r2.status));
+
+        $("resReqId").textContent = d2.request_id || "";
+        $("resDevId").textContent = d2.device_id || "";
+        $("resFp").textContent = d2.key_fingerprint || "";
+        $("formWrap").classList.add("hidden");
+        $("doneWrap").classList.remove("hidden");
+      } catch (e) {
+        setMsg(e.message || String(e), "err");
+      }
+    }
+
+    applyI18n();
+    readHashParams();
+  </script>
+</body>
+</html>
+"""
+
+
+def render_bootstrap_ui(lang: str = "en") -> str:
+    resolved = "ru" if (lang or "").lower().startswith("ru") else "en"
+    return BOOTSTRAP_UI_HTML.replace("__LOCUGARD_LANG__", resolved)
+
+
+def render_enroll_ui(lang: str = "en") -> str:
+    resolved = "ru" if (lang or "").lower().startswith("ru") else "en"
+    return ENROLL_UI_HTML.replace("__LOCUGARD_LANG__", resolved)

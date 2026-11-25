@@ -88,20 +88,7 @@ class TestNativeAndServiceContract(unittest.TestCase):
                 },
             )
 
-            # Bootstrap owner via local console
-            owner_priv, _ = _gen_ec_key()
-            owner_cid = secrets.token_bytes(16)
-            b = auth.bootstrap_owner_begin("Dima")
-            boot = auth.bootstrap_owner_complete(
-                challenge_id=b["challenge_id"],
-                display_name="Dima",
-                device_name="Owner-Browser",
-                credential_payload=_make_reg(b["options"]["challenge"], origin, rp_id, owner_priv, owner_cid),
-                hardware_binding=True,
-            )
-            owner_acc_id = boot["account_id"]
-
-            # Start real HTTPS server
+            # Start real HTTPS server BEFORE bootstrap to verify /bootstrap is open pre-init and 404 post-init
             cfg = uvicorn.Config(
                 app, host="127.0.0.1", port=port,
                 ssl_certfile=str(srv_crt), ssl_keyfile=str(srv_key),
@@ -118,6 +105,33 @@ class TestNativeAndServiceContract(unittest.TestCase):
 
             ssl_ctx = ssl.create_default_context(cafile=str(ca_crt))
             try:
+                # 0. /bootstrap is available before first owner exists, and closes (404) immediately after
+                st_boot_open, boot_html, _ = _https_json(f"{origin}/bootstrap?lang=ru", ctx=ssl_ctx)
+                self.assertEqual(st_boot_open, 200)
+                self.assertIn('<html lang="ru">', boot_html["raw"])
+                self.assertNotIn("localStorage.setItem", boot_html["raw"])
+
+                # Bootstrap owner via local console
+                owner_priv, _ = _gen_ec_key()
+                owner_cid = secrets.token_bytes(16)
+                b = auth.bootstrap_owner_begin("Dima")
+                boot = auth.bootstrap_owner_complete(
+                    challenge_id=b["challenge_id"],
+                    display_name="Dima",
+                    device_name="Owner-Browser",
+                    credential_payload=_make_reg(b["options"]["challenge"], origin, rp_id, owner_priv, owner_cid),
+                    hardware_binding=True,
+                )
+                owner_acc_id = boot["account_id"]
+
+                st_boot_closed, boot_closed_body, _ = _https_json(f"{origin}/bootstrap", ctx=ssl_ctx)
+                self.assertEqual(st_boot_closed, 404)
+                self.assertEqual(boot_closed_body.get("error"), "bootstrap_closed")
+
+                st_enr_ui, enr_html, _ = _https_json(f"{origin}/enroll", headers={"Accept-Language": "en-US"}, ctx=ssl_ctx)
+                self.assertEqual(st_enr_ui, 200)
+                self.assertIn('<html lang="en">', enr_html["raw"])
+                self.assertNotIn("localStorage.setItem", enr_html["raw"])
                 # 1. Built-in Web UI (GET /) + i18n (EN/RU) + brand assets with security headers and zero localStorage token usage
                 st, ui_res, ui_hdrs = _https_json(f"{origin}/", headers={"Accept-Language": "en-US,en;q=0.9"}, ctx=ssl_ctx)
                 self.assertEqual(st, 200)

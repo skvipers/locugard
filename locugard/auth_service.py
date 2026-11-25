@@ -649,10 +649,11 @@ class AuthService:
         webauthn, _, _, AuthSel, _, UVReq = _require_webauthn()
         now = time.time()
         err: AuthError | None = None
-        chal_bytes, chal_id, target_row = b"", "", None
+        chal_bytes, chal_id, target_row, allowed_role = b"", "", None, ""
         with self.store.transaction() as conn:
             code, err = self._validate_enrollment_code(conn, enrollment_id, secret, now)
             if err is None:
+                allowed_role = code["allowed_role"]
                 target_row = conn.execute("SELECT * FROM accounts WHERE account_id = ? AND state = 'active'", (code["target_account_id"],)).fetchone()
                 if not target_row:
                     err = AuthError("target_account_invalid", status_code=401)
@@ -666,7 +667,7 @@ class AuthService:
             self.store.audit("registration_begin_denied", "denied", reason_code=err.code, extra={"enrollment_id": enrollment_id})
             raise err
         opts = webauthn.generate_registration_options(rp_id=self.rp_id, rp_name=self.rp_name, user_id=target_row["account_id"].encode(), user_name=target_row["display_name"], challenge=chal_bytes, authenticator_selection=AuthSel(user_verification=UVReq.REQUIRED))
-        return {"challenge_id": chal_id, "options": json.loads(webauthn.options_to_json(opts))}
+        return {"challenge_id": chal_id, "allowed_role": allowed_role, "options": json.loads(webauthn.options_to_json(opts))}
 
     def submit_registration(
         self, *, enrollment_id: str, secret: str, challenge_id: str, device_name: str,

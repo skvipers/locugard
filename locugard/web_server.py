@@ -10,7 +10,7 @@ from typing import Any
 from .auth_channels import AuthChannels
 from .auth_permissions import AuthPermissionsBridge
 from .auth_service import AuthError, AuthService, extract_client_ip
-from .web_ui import render_web_ui, resolve_ui_lang
+from .web_ui import render_bootstrap_ui, render_enroll_ui, render_web_ui, resolve_ui_lang
 
 SESSION_COOKIE = "__Host-locugard_sid"
 _ASSETS_DIR = Path(__file__).resolve().parent / "assets"
@@ -548,6 +548,17 @@ def create_web_app(
         lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
         return HTMLResponse(render_web_ui(lang=lang))
 
+    async def web_ui_bootstrap(req: Request) -> Response:
+        # P0 инвариант: помощник bootstrap доступен ТОЛЬКО пока не создан первый активный owner с ключом
+        if auth.store.has_active_owner_with_key():
+            return JSONResponse({"error": "bootstrap_closed"}, status_code=404)
+        lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
+        return HTMLResponse(render_bootstrap_ui(lang=lang))
+
+    async def web_ui_enroll(req: Request) -> HTMLResponse:
+        lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
+        return HTMLResponse(render_enroll_ui(lang=lang))
+
     async def web_ui_asset(req: Request) -> Response:
         name = req.path_params.get("filename", "favicon.ico")
         mime = _ASSET_MIME.get(name)
@@ -590,6 +601,8 @@ def create_web_app(
     if include_ui:
         routes.insert(0, Route("/assets/{filename}", web_ui_asset, methods=["GET"]))
         routes.insert(0, Route("/favicon.ico", web_ui_asset, methods=["GET"]))
+        routes.insert(0, Route("/enroll", web_ui_enroll, methods=["GET"]))
+        routes.insert(0, Route("/bootstrap", web_ui_bootstrap, methods=["GET"]))
         routes.insert(0, Route("/", web_ui_index, methods=["GET"]))
 
     app = Starlette(routes=routes)
