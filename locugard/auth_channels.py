@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -9,8 +10,10 @@ from typing import Any
 
 from .auth_service import (
     CHALLENGE_TTL_S,
+    MAX_PENDING_REG_PER_ACCOUNT,
     MODE_DEFAULTS,
     REG_CHALLENGE_TTL_S,
+    REG_REQUEST_TTL_S,
     AuthError,
     AuthService,
     VerifiedContext,
@@ -23,6 +26,14 @@ ACCESS_TOKEN_TTL_S = 600
 TG_LINK_TTL_S = 300
 TG_CALLBACK_TTL_S = 300
 RECOVERY_REQ_TTL_S = 600
+_AUDIENCE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _validate_audience(audience: str | None) -> str:
+    val = (audience or "locugard").strip()
+    if not _AUDIENCE_RE.match(val):
+        raise AuthError("invalid_audience", status_code=400)
+    return val
 
 
 def _verify_ecdsa_p256(public_key_pem: bytes, message: bytes, signature: bytes) -> None:
@@ -60,6 +71,137 @@ class AuthChannels:
             )
         return {"device_id": dev_id, "credential_id": cred_id, "key_fingerprint": fp}
 
+    def app_register_begin(self, *, enrollment_id: str, secret: str, source_key: str = "unknown") -> dict[str, Any]:
+        """P3 (нативный клиент): проверка одноразового кода регистрации и выдача PoP-вызова."""
+        if not self.auth.rl.allow(f"reg_begin:{source_key}", 10, 3600):
+            raise AuthError("rate_limited", status_code=429)
+        now = time.time()
+        err: AuthError | None = None
+        out: dict[str, Any] = {}
+        with self.store.transaction() as conn:
+            enr, err = self.auth._validate_enrollment_code(conn, enrollment_id, secret, now)
+            if err is None:
+                chal_bytes = secrets.token_bytes(32)
+                chal_id = f"chal_{secrets.token_hex(12)}"
+                expires_at = now + REG_CHALLENGE_TTL_S
+                conn.execute(
+                    "INSERT INTO challenges (challenge_id, purpose, account_id, challenge_bytes, origin, rp_id, issued_at, expires_at, state) VALUES (?, 'app_register', ?, ?, ?, ?, ?, ?, 'issued')",
+                    (chal_id, enr["target_account_id"], chal_bytes, self.auth.expected_origin, self.auth.rp_id, now, expires_at),
+                )
+                out = {
+                    "challenge_id": chal_id,
+                    "challenge_hex": chal_bytes.hex(),
+                    "rp_id": self.auth.rp_id,
+                    "allowed_role": enr["allowed_role"],
+                    "target_account_id": enr["target_account_id"],
+                    "expires_at": expires_at,
+                }
+        if err is not None:
+            self.store.audit("app_register_begin_denied", "denied", reason_code=err.code, extra={"enrollment_id": enrollment_id})
+            raise err
+        return out
+
+    def app_register_submit(
+        self,
+        *,
+        enrollment_id: str,
+        secret: str,
+        challenge_id: str,
+        device_name: str,
+        requested_role: str,
+        public_key_pem: bytes,
+        signature: bytes,
+        hardware_binding: bool = False,
+        source_key: str = "unknown",
+    ) -> dict[str, Any]:
+        """P3 (нативный клиент): проверка PoP-подписи ECDSA P-256 и создание pending-заявки на одобрение owner."""
+        if not self.auth.rl.allow(f"reg_submit:{source_key}", 10, 3600):
+            raise AuthError("rate_limited", status_code=429)
+        now = time.time()
+        policy = self.store.get_server_policy()
+        err: AuthError | None = None
+        out: dict[str, Any] = {}
+        with self.store.transaction() as conn:
+            enr, err = self.auth._validate_enrollment_code(conn, enrollment_id, secret, now)
+            if err is None:
+                chal = conn.execute("SELECT * FROM challenges WHERE challenge_id = ?", (challenge_id,)).fetchone()
+                if not chal or chal["state"] != "issued" or chal["purpose"] != "app_register" or chal["account_id"] != enr["target_account_id"]:
+                    if chal and chal["state"] == "issued":
+                        conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                    err = AuthError("challenge_invalid", status_code=401)
+                elif now > chal["expires_at"]:
+                    conn.execute("UPDATE challenges SET state = 'expired' WHERE challenge_id = ?", (challenge_id,))
+                    err = AuthError("challenge_expired", status_code=401)
+                else:
+                    target = conn.execute("SELECT * FROM accounts WHERE account_id = ? AND state = 'active'", (enr["target_account_id"],)).fetchone()
+                    if not target:
+                        conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                        err = AuthError("target_account_invalid", status_code=404)
+                    elif requested_role != enr["allowed_role"] or requested_role != target["role"]:
+                        conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                        err = AuthError("role_mismatch", status_code=403)
+                    else:
+                        eff = self.auth.compute_effective_mode(policy, actor_min_mode=target["min_mode"], target_min_mode=target["min_mode"], action_min_mode=2, network_zone="lan")
+                        mcfg = MODE_DEFAULTS[eff]
+                        pending_cnt = conn.execute("SELECT COUNT(*) FROM registration_requests WHERE target_account_id = ? AND state = 'pending'", (target["account_id"],)).fetchone()[0]
+                        if not mcfg["new_device_access"]:
+                            conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                            err = AuthError("new_devices_forbidden_in_mode_4", status_code=403)
+                        elif pending_cnt >= MAX_PENDING_REG_PER_ACCOUNT:
+                            conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                            err = AuthError("too_many_pending_registrations", status_code=429)
+                        elif mcfg["hardware_key_required"] and not hardware_binding:
+                            conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                            err = AuthError("hardware_key_required", status_code=403)
+                        else:
+                            domain_msg = f"locugard:app_register:{chal['rp_id']}:{enrollment_id}:".encode() + chal["challenge_bytes"]
+                            try:
+                                _verify_ecdsa_p256(public_key_pem, domain_msg, signature)
+                            except Exception:
+                                conn.execute("UPDATE challenges SET state = 'invalidated', attempt_count = 1 WHERE challenge_id = ?", (challenge_id,))
+                                err = AuthError("invalid_signature", status_code=401)
+                            else:
+                                dev_id = f"dev_{secrets.token_hex(8)}"
+                                cred_id = f"cred_{secrets.token_hex(8)}"
+                                req_id = f"rreq_{secrets.token_hex(8)}"
+                                fp = key_fingerprint(public_key_pem)
+                                expires_at = now + REG_REQUEST_TTL_S
+                                conn.execute("UPDATE challenges SET state = 'consumed', attempt_count = 1, consumed_at = ? WHERE challenge_id = ?", (now, challenge_id))
+                                conn.execute("UPDATE enrollment_codes SET state = 'consumed', consumed_at = ? WHERE enrollment_id = ?", (now, enrollment_id))
+                                conn.execute(
+                                    "INSERT INTO devices (device_id, account_id, display_name, kind, state, attestation_level, hardware_binding, created_at) VALUES (?, ?, ?, 'app_install', 'pending', ?, ?, ?)",
+                                    (dev_id, target["account_id"], device_name.strip() or "Native Device", "direct" if hardware_binding else "none", int(hardware_binding), now),
+                                )
+                                conn.execute(
+                                    "INSERT INTO credentials (credential_id, device_id, account_id, external_credential_id, public_key, algorithm, key_type, key_fingerprint, user_verification, attestation_level, backup_state, state, created_at) VALUES (?, ?, ?, ?, ?, 'ES256', 'os_keystore', ?, 1, ?, 'single_device', 'pending', ?)",
+                                    (cred_id, dev_id, target["account_id"], f"app_{cred_id}", public_key_pem, fp, "direct" if hardware_binding else "none", now),
+                                )
+                                conn.execute(
+                                    "INSERT INTO registration_requests (request_id, enrollment_id, target_account_id, device_id, credential_id, requested_role, key_fingerprint, created_at, expires_at, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                                    (req_id, enrollment_id, target["account_id"], dev_id, cred_id, requested_role, fp, now, expires_at),
+                                )
+                                out = {
+                                    "request_id": req_id,
+                                    "device_id": dev_id,
+                                    "credential_id": cred_id,
+                                    "key_fingerprint": fp,
+                                    "state": "pending",
+                                    "expires_at": expires_at,
+                                    "target_account_id": target["account_id"],
+                                }
+        if err is not None:
+            self.store.audit("app_register_denied", "denied", reason_code=err.code, extra={"enrollment_id": enrollment_id})
+            raise err
+        self.store.audit("registration_request_created", "ok", account_id=out["target_account_id"], device_id=out["device_id"], credential_id=out["credential_id"], extra={"request_id": out["request_id"], "key_fingerprint": out["key_fingerprint"], "channel": "app"})
+        return {
+            "request_id": out["request_id"],
+            "device_id": out["device_id"],
+            "credential_id": out["credential_id"],
+            "key_fingerprint": out["key_fingerprint"],
+            "state": "pending",
+            "expires_at": out["expires_at"],
+        }
+
     def app_login_begin(self, *, device_id: str, source_key: str = "unknown") -> dict[str, Any]:
         if not self.auth.rl.allow(f"app_login_chal:{source_key}", 10, 60):
             raise AuthError("rate_limited", status_code=429)
@@ -69,12 +211,13 @@ class AuthChannels:
                 "INSERT INTO challenges (challenge_id, purpose, device_id, challenge_bytes, origin, rp_id, issued_at, expires_at, state) VALUES (?, 'app_login', ?, ?, ?, ?, ?, ?, 'issued')",
                 (chal_id, device_id, chal_bytes, self.auth.expected_origin, self.auth.rp_id, now, now + CHALLENGE_TTL_S),
             )
-        return {"challenge_id": chal_id, "challenge_hex": chal_bytes.hex()}
+        return {"challenge_id": chal_id, "challenge_hex": chal_bytes.hex(), "rp_id": self.auth.rp_id, "expires_at": now + CHALLENGE_TTL_S}
 
     def app_login_verify(
         self, *, challenge_id: str, device_id: str, signature: bytes, user_verified: bool,
-        peer_ip: str | None, forwarded_for: str | None = None,
+        peer_ip: str | None, forwarded_for: str | None = None, audience: str = "locugard",
     ) -> dict[str, Any]:
+        aud = _validate_audience(audience)
         now = time.time()
         policy = self.store.get_server_policy()
         zone = resolve_network_zone(peer_ip, policy["allowed_networks"], self.auth.trusted_proxies, forwarded_for)
@@ -141,14 +284,28 @@ class AuthChannels:
                     (ver_id, acc["account_id"], dev["device_id"], cred["credential_id"], sess_id, challenge_id, now, eff),
                 )
                 conn.execute(
-                    "INSERT INTO sessions (session_id, session_token_hash, csrf_token_hash, account_id, device_id, credential_id, auth_method, authenticated_at, identity_verification_id, created_at, last_activity_at, absolute_expires_at, idle_expires_at, access_token_expires_at, network_zone_at_login, mode_at_login, state) VALUES (?, ?, ?, ?, ?, ?, 'app_keystore_uv', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
-                    (sess_id, hash_secret(access_token, self.store.pepper), hash_secret(csrf_token, self.store.pepper), acc["account_id"], dev["device_id"], cred["credential_id"], now, ver_id, now, now, abs_exp, idle_exp, access_exp, zone, eff),
+                    "INSERT INTO sessions (session_id, session_token_hash, csrf_token_hash, account_id, device_id, credential_id, auth_method, authenticated_at, identity_verification_id, created_at, last_activity_at, absolute_expires_at, idle_expires_at, access_token_expires_at, audience, network_zone_at_login, mode_at_login, state) VALUES (?, ?, ?, ?, ?, ?, 'app_keystore_uv', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                    (sess_id, hash_secret(access_token, self.store.pepper), hash_secret(csrf_token, self.store.pepper), acc["account_id"], dev["device_id"], cred["credential_id"], now, ver_id, now, now, abs_exp, idle_exp, access_exp, aud, zone, eff),
                 )
                 conn.execute(
                     "INSERT INTO refresh_token_chains (chain_id, session_id, generation, current_token_hash, rotated_at, state) VALUES (?, ?, 1, ?, ?, 'active')",
                     (chain_id, sess_id, hash_secret(refresh_token, self.store.pepper), now),
                 )
-                out = {"session_id": sess_id, "chain_id": chain_id, "access_token": access_token, "access_expires_in": ACCESS_TOKEN_TTL_S, "refresh_token": refresh_token, "generation": 1}
+                out = {
+                    "session_id": sess_id,
+                    "chain_id": chain_id,
+                    "account_id": acc["account_id"],
+                    "role": acc["role"],
+                    "device_id": dev["device_id"],
+                    "audience": aud,
+                    "access_token": access_token,
+                    "access_expires_in": ACCESS_TOKEN_TTL_S,
+                    "access_expires_at": access_exp,
+                    "session_expires_at": abs_exp,
+                    "idle_expires_at": idle_exp,
+                    "refresh_token": refresh_token,
+                    "generation": 1,
+                }
         if err is not None:
             self.store.audit("app_login_denied", "denied", reason_code=err.code, account_id=acc_id_log, device_id=device_id, network_zone=zone)
             raise err
@@ -178,6 +335,10 @@ class AuthChannels:
                 conn.execute("UPDATE refresh_token_chains SET state = 'revoked', revoked_at = COALESCE(revoked_at, ?), revocation_reason = 'refresh_reuse_detected', reuse_detected_at = COALESCE(reuse_detected_at, ?) WHERE chain_id = ?", (now, now, chain["chain_id"]))
                 conn.execute("UPDATE sessions SET state = 'revoked', ended_at = COALESCE(ended_at, ?), end_reason = 'refresh_reuse_detected' WHERE session_id = ?", (now, chain["session_id"]))
                 if was_active:
+                    self.store.record_revocation_event_conn(
+                        conn, "refresh_reuse_detected", reason="refresh_reuse_detected",
+                        account_id=sess["account_id"], device_id=sess["device_id"], session_id=sess["session_id"], audience=sess["audience"], occurred_at=now,
+                    )
                     notify_reuse = (sess["account_id"], sess["device_id"], sess["session_id"])
                 err = AuthError("refresh_reuse_detected", status_code=401)
             else:
@@ -222,10 +383,21 @@ class AuthChannels:
                                 conn.execute("INSERT INTO refresh_token_history (chain_id, generation, token_hash, rotated_at) VALUES (?, ?, ?, ?)", (chain["chain_id"], chain["generation"], chain["current_token_hash"], now))
                                 conn.execute("UPDATE refresh_token_chains SET generation = ?, current_token_hash = ?, rotated_at = ? WHERE chain_id = ?", (new_gen, hash_secret(new_refresh, self.store.pepper), now, chain["chain_id"]))
                                 conn.execute("UPDATE sessions SET session_token_hash = ?, access_token_expires_at = ? WHERE session_id = ?", (hash_secret(new_access, self.store.pepper), access_exp, sess["session_id"]))
-                                out = {"access_token": new_access, "refresh_token": new_refresh, "generation": new_gen, "access_expires_in": ACCESS_TOKEN_TTL_S}
+                                out = {
+                                    "session_id": sess["session_id"],
+                                    "audience": sess["audience"],
+                                    "access_token": new_access,
+                                    "refresh_token": new_refresh,
+                                    "generation": new_gen,
+                                    "access_expires_in": ACCESS_TOKEN_TTL_S,
+                                    "access_expires_at": access_exp,
+                                    "session_expires_at": eff_abs,
+                                    "idle_expires_at": eff_idle,
+                                }
 
         if err is not None:
             if notify_reuse:
+                self.store.emit_revocation_signal()
                 self.store.audit("refresh_reuse_detected", "denied", reason_code="refresh_reuse_detected", account_id=notify_reuse[0], device_id=notify_reuse[1], session_id=notify_reuse[2], network_zone=zone)
                 self.store.notify("refresh_reuse_detected", [notify_reuse[0]], {"account_id": notify_reuse[0], "device_id": notify_reuse[1], "session_id": notify_reuse[2]})
             else:
@@ -233,6 +405,64 @@ class AuthChannels:
             raise err
         assert out is not None
         return out
+
+    def app_logout(self, *, access_token: str | None) -> None:
+        """P5 (нативный клиент): выход по Bearer access_token с отзывом refresh-цепочки и событием отзыва."""
+        if not access_token:
+            raise AuthError("unauthorized", status_code=401)
+        now = time.time()
+        tok_hash = hash_secret(access_token, self.store.pepper)
+        with self.store.transaction() as conn:
+            sess = conn.execute("SELECT * FROM sessions WHERE session_token_hash = ? AND state = 'active'", (tok_hash,)).fetchone()
+            if not sess:
+                raise AuthError("session_invalid_or_revoked", status_code=401)
+            conn.execute("UPDATE sessions SET state = 'closed', ended_at = ?, end_reason = 'user_logout' WHERE session_id = ?", (now, sess["session_id"]))
+            conn.execute("UPDATE refresh_token_chains SET state = 'revoked', revoked_at = ?, revocation_reason = 'user_logout' WHERE session_id = ? AND state = 'active'", (now, sess["session_id"]))
+            self.store.record_revocation_event_conn(
+                conn, "session_closed", reason="user_logout",
+                account_id=sess["account_id"], device_id=sess["device_id"], session_id=sess["session_id"], audience=sess["audience"], occurred_at=now,
+            )
+        self.store.emit_revocation_signal()
+        self.store.audit("session_closed", "ok", reason_code="user_logout", account_id=sess["account_id"], device_id=sess["device_id"], session_id=sess["session_id"])
+
+    def introspect_token(
+        self,
+        *,
+        access_token: str | None,
+        expected_audience: str,
+        peer_ip: str | None = None,
+        forwarded_for: str | None = None,
+        touch_activity: bool = False,
+    ) -> dict[str, Any]:
+        """Серверная интроспекция Bearer-токена для внешних сервисов (Apogeus, Docalaizer) без доступа к SQLite/pepper."""
+        aud = _validate_audience(expected_audience)
+        try:
+            ctx = self.auth.verify_session(
+                access_token,
+                peer_ip=peer_ip,
+                forwarded_for=forwarded_for,
+                action_min_mode=1,
+                touch_activity=touch_activity,
+                expected_audience=aud,
+            )
+        except AuthError as e:
+            return {"active": False, "reason": e.code}
+        acc = self.store.get_account(ctx.account_id)
+        return {
+            "active": True,
+            "account_id": ctx.account_id,
+            "display_name": acc["display_name"] if acc else "",
+            "role": ctx.role,
+            "device_id": ctx.device_id,
+            "session_id": ctx.session_id,
+            "audience": ctx.audience,
+            "effective_mode": ctx.effective_mode,
+            "network_zone": ctx.network_zone,
+            "access_expires_at": ctx.access_token_expires_at,
+            "session_expires_at": ctx.absolute_expires_at,
+            "idle_expires_at": ctx.idle_expires_at,
+            "policy_version": ctx.policy_version,
+        }
 
     # =========================================================================
     # P4: Проверенная привязка Telegram и опциональное одобрение (режим 2, non-owner)
@@ -511,6 +741,8 @@ class AuthChannels:
             conn.execute("UPDATE sessions SET state = 'revoked', ended_at = ?, end_reason = 'account_suspended' WHERE account_id = ? AND state = 'active'", (now, target_account_id))
             conn.execute("UPDATE refresh_token_chains SET state = 'revoked', revoked_at = ?, revocation_reason = 'account_suspended' WHERE state = 'active' AND session_id IN (SELECT session_id FROM sessions WHERE account_id = ?)", (now, target_account_id))
             conn.execute("UPDATE action_approvals SET state = 'revoked', resolution_reason = 'account_suspended' WHERE account_id = ? AND state IN ('pending', 'approved')", (target_account_id,))
+            self.store.record_revocation_event_conn(conn, "account_suspended", reason="account_suspended", account_id=target_account_id, occurred_at=now)
+        self.store.emit_revocation_signal()
         self.store.audit("account_suspended", "ok", account_id=ctx.account_id, extra={"target_account_id": target_account_id})
 
     # =========================================================================
@@ -692,6 +924,7 @@ class AuthChannels:
         if err is not None:
             self.store.audit("recovery_confirm_denied", "denied", reason_code=err.code, extra={"recovery_request_id": recovery_request_id})
             raise err
+        self.store.emit_revocation_signal()
         self.store.audit("recovery_completed", "ok", account_id=out["account_id"], device_id=out["device_id"], credential_id=out["credential_id"], extra={"recovery_request_id": recovery_request_id, "key_fingerprint": out["key_fingerprint"]})
         self.store.notify("recovery_completed", [out["account_id"]], {"recovery_request_id": recovery_request_id, "new_device_id": out["device_id"], "key_fingerprint": out["key_fingerprint"]})
         return {"recovery_request_id": out["recovery_request_id"], "device_id": out["device_id"], "state": "completed"}
@@ -707,6 +940,7 @@ class AuthChannels:
         conn.execute("UPDATE action_approvals SET state = 'revoked', resolution_reason = ? WHERE account_id = ? AND state IN ('pending', 'approved')", (reason, account_id))
         conn.execute("UPDATE telegram_callbacks SET state = 'revoked' WHERE account_id = ? AND state = 'issued'", (account_id,))
         conn.execute("UPDATE recovery_requests SET state = 'cancelled', resolved_at = ?, resolution_reason = ? WHERE account_id = ? AND (? IS NULL OR recovery_request_id != ?) AND state = 'pending'", (now, reason, account_id, keep_rreq_id, keep_rreq_id))
+        self.store.record_revocation_event_conn(conn, "account_sessions_revoked", reason=reason, account_id=account_id, occurred_at=now)
 
     def console_recover_owner(self, *, account_id: str, new_public_key_pem: bytes, device_name: str, hardware_binding: bool = True) -> dict[str, Any]:
         now = time.time()
@@ -725,6 +959,7 @@ class AuthChannels:
                 "INSERT INTO recovery_requests (recovery_request_id, account_id, basis, device_id, credential_id, key_fingerprint, revocation_scope, policy_version, created_at, expires_at, state, resolved_at) VALUES (?, ?, 'local_console', ?, ?, ?, 'revoke_all', ?, ?, ?, 'completed', ?)",
                 (rreq_id, account_id, dev_id, cred_id, fp, policy["policy_version"], now, now, now),
             )
+        self.store.emit_revocation_signal()
         self.store.audit("console_recovery_completed", "ok", account_id=account_id, device_id=dev_id, network_zone="local_console", policy_version=policy["policy_version"], extra={"key_fingerprint": fp})
         self.store.notify("recovery_completed", [account_id], {"basis": "local_console", "new_device_id": dev_id, "key_fingerprint": fp})
         return {"recovery_request_id": rreq_id, "device_id": dev_id, "credential_id": cred_id, "key_fingerprint": fp}

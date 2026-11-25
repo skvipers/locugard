@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS server_policy (
@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     absolute_expires_at REAL NOT NULL,
     idle_expires_at REAL NOT NULL,
     access_token_expires_at REAL,
+    audience TEXT NOT NULL DEFAULT 'locugard',
     network_zone_at_login TEXT NOT NULL,
     mode_at_login INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('active', 'closed', 'expired', 'revoked')),
@@ -281,6 +282,17 @@ CREATE TABLE IF NOT EXISTS action_approvals (
     executed_at REAL,
     resolution_reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS revocation_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    account_id TEXT,
+    device_id TEXT,
+    session_id TEXT,
+    audience TEXT,
+    reason TEXT NOT NULL,
+    occurred_at REAL NOT NULL
+);
 """
 
 
@@ -341,6 +353,7 @@ class AuthStore:
             raise ValueError("pepper должен быть не короче 32 байт")
         self.on_notify = on_notify
         self._audit_lock = threading.Lock()
+        self._revocation_cond = threading.Condition()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -383,6 +396,9 @@ class AuthStore:
         finally:
             conn.close()
         with self.transaction() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "audience" not in cols:
+                conn.execute("ALTER TABLE sessions ADD COLUMN audience TEXT NOT NULL DEFAULT 'locugard'")
             ver = conn.execute("PRAGMA user_version").fetchone()[0]
             if ver < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -545,12 +561,129 @@ class AuthStore:
         with self.readonly() as conn:
             if account_id:
                 rows = conn.execute(
-                    "SELECT * FROM devices WHERE account_id = ? ORDER BY created_at DESC",
+                    """
+                    SELECT d.*,
+                           (SELECT COUNT(*) FROM sessions s WHERE s.device_id = d.device_id AND s.state = 'active') AS active_sessions_count
+                    FROM devices d
+                    WHERE d.account_id = ?
+                    ORDER BY d.created_at DESC
+                    """,
                     (account_id,),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM devices ORDER BY created_at DESC").fetchall()
+                rows = conn.execute(
+                    """
+                    SELECT d.*,
+                           (SELECT COUNT(*) FROM sessions s WHERE s.device_id = d.device_id AND s.state = 'active') AS active_sessions_count
+                    FROM devices d
+                    ORDER BY d.created_at DESC
+                    """
+                ).fetchall()
             return [dict(r) for r in rows]
+
+    def list_registration_requests(self, *, state: str | None = "pending") -> list[dict[str, Any]]:
+        with self.readonly() as conn:
+            if state:
+                rows = conn.execute(
+                    """
+                    SELECT rr.*, d.display_name AS device_name, d.kind AS device_kind, d.hardware_binding AS hardware_binding
+                    FROM registration_requests rr
+                    JOIN devices d ON d.device_id = rr.device_id
+                    WHERE rr.state = ?
+                    ORDER BY rr.created_at DESC
+                    """,
+                    (state,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT rr.*, d.display_name AS device_name, d.kind AS device_kind, d.hardware_binding AS hardware_binding
+                    FROM registration_requests rr
+                    JOIN devices d ON d.device_id = rr.device_id
+                    ORDER BY rr.created_at DESC
+                    """
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def record_revocation_event_conn(
+        self,
+        conn: sqlite3.Connection,
+        event_type: str,
+        *,
+        reason: str,
+        account_id: str | None = None,
+        device_id: str | None = None,
+        session_id: str | None = None,
+        audience: str | None = None,
+        occurred_at: float | None = None,
+    ) -> int:
+        ts = time.time() if occurred_at is None else occurred_at
+        cur = conn.execute(
+            """
+            INSERT INTO revocation_events (event_type, account_id, device_id, session_id, audience, reason, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_type, account_id, device_id, session_id, audience, reason, ts),
+        )
+        return int(cur.lastrowid)
+
+    def emit_revocation_signal(self) -> None:
+        with self._revocation_cond:
+            self._revocation_cond.notify_all()
+
+    def latest_revocation_seq(self) -> int:
+        with self.readonly() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM revocation_events").fetchone()
+            return int(row["m"]) if row else 0
+
+    def list_revocation_events(
+        self,
+        *,
+        since_seq: int = 0,
+        limit: int = 100,
+        allowed_audiences: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.readonly() as conn:
+            rows = conn.execute(
+                "SELECT * FROM revocation_events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+                (int(since_seq), int(limit)),
+            ).fetchall()
+        events = [dict(r) for r in rows]
+        if allowed_audiences is None:
+            return events
+        return [
+            e for e in events
+            if e["audience"] is None or e["audience"] in allowed_audiences
+        ]
+
+    def wait_for_revocation_events(
+        self,
+        *,
+        since_seq: int,
+        timeout_s: float = 15.0,
+        allowed_audiences: set[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Ожидает новые события отзыва после since_seq (мгновенное пробуждение по Condition)."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self.readonly() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM revocation_events WHERE seq > ? ORDER BY seq ASC LIMIT 100",
+                    (int(since_seq),),
+                ).fetchall()
+            if rows:
+                last_seq = int(rows[-1]["seq"])
+                events = [dict(r) for r in rows]
+                if allowed_audiences is not None:
+                    events = [e for e in events if e["audience"] is None or e["audience"] in allowed_audiences]
+                if events:
+                    return events, last_seq
+                since_seq = last_seq
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [], since_seq
+            with self._revocation_cond:
+                self._revocation_cond.wait(timeout=min(remaining, 1.0))
 
     def revoke_all_account_sessions(self, account_id: str, reason: str, *, initiated_by: str | None = None) -> int:
         now = time.time()
@@ -568,6 +701,10 @@ class AuthStore:
                 (now, reason, account_id),
             )
             count = cur.rowcount
+            self.record_revocation_event_conn(
+                conn, "account_sessions_revoked", reason=reason, account_id=account_id, occurred_at=now,
+            )
+        self.emit_revocation_signal()
         self.audit("account_sessions_revoked", "ok", reason_code=reason, account_id=account_id, extra={"count": count, "initiated_by": initiated_by})
         self.notify("sessions_revoked", [account_id], {"account_id": account_id, "reason": reason, "count": count})
         return count
@@ -644,6 +781,10 @@ class AuthStore:
                 """,
                 (now, reason, device_id, device_id),
             )
+            self.record_revocation_event_conn(
+                conn, "device_revoked", reason=reason, account_id=account_id, device_id=device_id, occurred_at=now,
+            )
+        self.emit_revocation_signal()
         self.audit(
             "device_revoked",
             "ok",

@@ -52,6 +52,10 @@ class VerifiedContext:
     effective_mode: int
     policy_version: int
     granted_scopes: tuple[str, ...]
+    audience: str = "locugard"
+    absolute_expires_at: float | None = None
+    idle_expires_at: float | None = None
+    access_token_expires_at: float | None = None
 
 
 def _in_cidr(ip: Any, cidr: str) -> bool:
@@ -517,7 +521,14 @@ class AuthService:
         return {"verification_id": ver_id, "verified_at": now}
 
     def verify_session(
-        self, session_token: str | None, *, peer_ip: str | None, forwarded_for: str | None = None, action_min_mode: int = 2, touch_activity: bool = True,
+        self,
+        session_token: str | None,
+        *,
+        peer_ip: str | None,
+        forwarded_for: str | None = None,
+        action_min_mode: int = 2,
+        touch_activity: bool = True,
+        expected_audience: str | None = None,
     ) -> VerifiedContext:
         if not session_token:
             raise AuthError("unauthorized", status_code=401)
@@ -557,7 +568,10 @@ class AuthService:
                         err = AuthError("step_up_relogin_required", status_code=401)
                     elif mode_cfg["hardware_key_required"] and not dev["hardware_binding"]:
                         err = AuthError("hardware_key_required", status_code=403)
+                    elif expected_audience is not None and sess["audience"] != expected_audience:
+                        err = AuthError("audience_mismatch", status_code=403)
                     else:
+                        new_idle = eff_idle
                         if touch_activity:
                             new_idle = min(eff_abs, now + min(policy["idle_ttl_s"], mode_cfg["idle_ttl_s"]))
                             conn.execute("UPDATE sessions SET last_activity_at = ?, idle_expires_at = ? WHERE session_id = ?", (now, new_idle, sess["session_id"]))
@@ -570,6 +584,8 @@ class AuthService:
                             authenticated_at=sess["authenticated_at"], identity_verification_id=ver["verification_id"],
                             last_identity_verified_at=ver["verified_at"], network_zone=zone, effective_mode=eff_mode,
                             policy_version=policy["policy_version"], granted_scopes=scopes,
+                            audience=sess["audience"], absolute_expires_at=eff_abs,
+                            idle_expires_at=new_idle, access_token_expires_at=sess["access_token_expires_at"],
                         )
         if err is not None:
             raise err
@@ -787,6 +803,10 @@ class AuthService:
         with self.store.transaction() as conn:
             conn.execute("UPDATE sessions SET state = 'closed', ended_at = ?, end_reason = 'user_logout' WHERE session_id = ? AND state = 'active'", (now, ctx.session_id))
             conn.execute("UPDATE refresh_token_chains SET state = 'revoked', revoked_at = ?, revocation_reason = 'user_logout' WHERE session_id = ? AND state = 'active'", (now, ctx.session_id))
+            self.store.record_revocation_event_conn(
+                conn, "session_closed", reason="user_logout", account_id=ctx.account_id, device_id=ctx.device_id, session_id=ctx.session_id, audience=ctx.audience, occurred_at=now,
+            )
+        self.store.emit_revocation_signal()
         self.store.audit("session_closed", "ok", reason_code="user_logout", account_id=ctx.account_id, device_id=ctx.device_id, session_id=ctx.session_id, network_zone=ctx.network_zone)
 
     def logout_by_token(self, session_token: str | None, csrf_token: str | None) -> None:
@@ -806,6 +826,10 @@ class AuthService:
                 raise AuthError("csrf_failed", status_code=403)
             conn.execute("UPDATE sessions SET state = 'closed', ended_at = ?, end_reason = 'user_logout' WHERE session_id = ?", (now, sess["session_id"]))
             conn.execute("UPDATE refresh_token_chains SET state = 'revoked', revoked_at = ?, revocation_reason = 'user_logout' WHERE session_id = ? AND state = 'active'", (now, sess["session_id"]))
+            self.store.record_revocation_event_conn(
+                conn, "session_closed", reason="user_logout", account_id=sess["account_id"], device_id=sess["device_id"], session_id=sess["session_id"], audience=sess["audience"], occurred_at=now,
+            )
+        self.store.emit_revocation_signal()
         self.store.audit("session_closed", "ok", reason_code="user_logout", account_id=sess["account_id"], device_id=sess["device_id"], session_id=sess["session_id"])
 
     def revoke_device(self, ctx: VerifiedContext, *, device_id: str, reason: str = "user_revoked") -> None:

@@ -101,19 +101,122 @@ All mutating (`POST`) endpoints require an exact `Origin` header matching `expec
 
 | Method & Path | Auth Required | CSRF | Purpose / Request JSON |
 | --- | --- | --- | --- |
+| `GET /` *(when `include_ui=True`)* | No | No | Built-in Web UI (sign-in, session card, devices/enrollment/approvals, dangerous actions, offline recovery codes). |
 | `POST /auth/login/options` | No | No | Returns `{challenge_id, options}` for `navigator.credentials.get()`. |
 | `POST /auth/login/verify` | No | No | `{challenge_id, credential}` → sets `__Host-locugard_sid` cookie and returns `{account_id, role, device_id, csrf_token}`. |
 | `POST /auth/reauth/options` | Session | Yes | Step-up challenge `{challenge_id, options}` for fresh verification. |
 | `POST /auth/reauth/verify` | Session | Yes | `{challenge_id, credential, purpose?, target_digest?}` → `{verification_id, verified_at}`. |
 | `POST /auth/logout` | Session | Yes | Revokes current session and clears `__Host-locugard_sid`. |
-| `POST /api/devices/enrollment-codes` | Owner + fresh | Yes | `{target_account_id?, role?, ttl_s?}` → one-time `{code, code_id, expires_at}`. |
-| `POST /auth/register/options` | No (code) | No | `{code, device_name}` → returns `{challenge_id, registration_request_id, options}`. |
-| `POST /auth/register/submit` | No (challenge) | No | `{challenge_id, registration_request_id, credential, hardware_binding?}` → submits pending device for owner approval. |
+| `GET /api/devices` | Session | No | Returns `{devices: [...]}` (all devices for `owner`, own devices for non-`owner`). |
+| `POST /api/devices/enrollment-codes` | Owner + fresh | Yes | `{target_account_id?}` → one-time `{enrollment_id, secret, target_account_id, allowed_role, expires_at}`. |
+| `GET /api/devices/registrations` | Owner | No | Returns `{requests: [...]}` of pending device registrations with `key_fingerprint`. |
+| `POST /auth/register/options` | No (code) | No | `{enrollment_id, secret}` → returns `{challenge_id, options, allowed_role, target_account_id}`. |
+| `POST /auth/register/submit` | No (challenge) | No | `{enrollment_id, secret, challenge_id, device_name, requested_role, credential}` → submits pending device for owner approval. |
 | `POST /api/devices/registrations/{request_id}/approve` | Owner + fresh | Yes | `{second_verification_id?}` → activates pending device & credential. |
-| `POST /api/devices/{device_id}/revoke` | Owner + fresh | Yes | `{reason?, second_verification_id?}` → immediately revokes device, credentials, sessions, and refresh chains. |
-| `GET /api/protected/profile` | Session | No | Returns `{account_id, role, device_id, effective_mode, network_zone}`. |
-| `POST /api/protected/dangerous-action/request` | Session + fresh | Yes | `{target, note?, second_verification_id?}` → `{approval_id, action_digest, permissions_pid, expires_at}`. |
+| `POST /api/devices/{device_id}/revoke` | Owner / self | Yes | Immediately revokes device, credentials, sessions, refresh chains, and emits a real-time revocation event. |
+| `POST /api/recovery-codes` | Owner + fresh | Yes | `{second_verification_id?, target_digest?}` → generates 10 one-time offline recovery codes. |
+| `GET /api/protected/profile` | Session | No | Returns `{account_id, display_name, role, device_id, effective_mode, network_zone}`. |
+| `POST /api/protected/dangerous-action/request` | Session + fresh | Yes | `{target, note?, second_verification_id?}` → `{approval_id, action_digest, description, expires_at, state}`. |
 | `POST /api/protected/dangerous-action/confirm` | Session + fresh | Yes | `{approval_id, action_digest}` → re-verifies auth state live and executes via `Permissions.confirm()`. |
+
+---
+
+## 3.1 Native Client HTTPS Contract (`v0.2.0` — Flutter Windows / Android)
+
+Native clients use OS-keystore ECDSA P-256 keys (Windows CNG / Android Keystore), do **not** use browser cookies, and do **not** require `Origin` or CSRF headers. All endpoints run over HTTPS and reuse `locugard.auth_channels.AuthChannels`.
+
+### Enrollment (binding a new device to an existing account)
+
+1. Owner creates a one-time enrollment code (`POST /api/devices/enrollment-codes` or Web UI → **Устройства**) and passes `{enrollment_id, secret}` to the native device (QR / copy).
+2. **`POST /auth/app/register/options`**
+   - Request: `{"enrollment_id": "enr_...", "secret": "..."}`
+   - Response `200`: `{"challenge_id": "chal_...", "challenge_hex": "...", "rp_id": "locugard.home.arpa", "allowed_role": "owner", "target_account_id": "acc_...", "expires_at": 1764000300.0}`
+   - Errors: `401 enrollment_code_invalid | enrollment_code_expired`, `429 rate_limited`.
+3. Native client generates ECDSA P-256 keypair in OS keystore and signs the domain-separated PoP bytes:
+   `utf8("locugard:app_register:{rp_id}:{enrollment_id}:") + bytes.fromhex(challenge_hex)` (SHA-256, ASN.1 DER signature, base64url or base64 encoded).
+4. **`POST /auth/app/register/submit`**
+   - Request: `{"enrollment_id", "secret", "challenge_id", "device_name", "requested_role", "public_key_pem", "signature_b64", "hardware_binding": true}`
+   - Response `200`: `{"request_id": "rreq_...", "device_id": "dev_...", "credential_id": "cred_...", "key_fingerprint": "a1b2:...", "state": "pending", "expires_at": ...}`
+   - Errors: `400 invalid_payload`, `401 challenge_invalid | challenge_expired | invalid_signature`, `403 role_mismatch | hardware_key_required | new_devices_forbidden_in_mode_4`, `429 rate_limited | too_many_pending_registrations`.
+5. Owner verifies `key_fingerprint` and approves `request_id` on a trusted device (`POST /api/devices/registrations/{request_id}/approve` or Web UI).
+
+### Login, Session Refresh & Logout
+
+1. **`POST /auth/app/login/options`**
+   - Request: `{"device_id": "dev_..."}`
+   - Response `200`: `{"challenge_id": "chal_...", "challenge_hex": "...", "rp_id": "locugard.home.arpa", "expires_at": ...}`
+2. Native client signs `utf8("locugard:app_login:{rp_id}:{device_id}:") + bytes.fromhex(challenge_hex)` after OS biometric/PIN verification (`user_verified: true`).
+3. **`POST /auth/app/login/verify`**
+   - Request: `{"challenge_id", "device_id", "signature_b64", "user_verified": true, "audience": "apogeus"}`
+   - Response `200`:
+     ```json
+     {
+       "session_id": "sess_...",
+       "chain_id": "chn_...",
+       "account_id": "acc_...",
+       "role": "owner",
+       "device_id": "dev_...",
+       "audience": "apogeus",
+       "access_token": "...",
+       "access_expires_in": 600,
+       "access_expires_at": 1764000600.0,
+       "session_expires_at": 1764604800.0,
+       "idle_expires_at": 1764043200.0,
+       "refresh_token": "...",
+       "generation": 1
+     }
+     ```
+   - Errors: `400 invalid_payload | invalid_audience`, `401 authentication_failed | challenge_expired`, `403 outside_allowed_network | role_forbidden_in_mode | user_verification_required | hardware_key_required`.
+4. **`POST /auth/app/refresh`**
+   - Request: `{"refresh_token": "..."}`
+   - Response `200`: `{"session_id", "audience", "access_token", "refresh_token", "generation": 2, "access_expires_in": 600, "access_expires_at", "session_expires_at", "idle_expires_at"}`
+   - Errors: `401 refresh_invalid | refresh_reuse_detected | refresh_chain_revoked | session_invalid_or_revoked | context_revoked_or_inactive | session_expired`, `403 outside_allowed_network | role_forbidden_in_mode | hardware_key_required`, `429 rate_limited`.
+   - **Reuse protection:** replaying any previously rotated `refresh_token` immediately revokes the entire `RefreshTokenChain` and `Session` and emits a `refresh_reuse_detected` revocation event.
+5. **`POST /auth/app/logout`**
+   - Header: `Authorization: Bearer <access_token>`
+   - Response `200`: `{"status": "logged_out"}`
+
+---
+
+## 3.2 Service-to-Service Contract (`v0.2.0` — Apogeus & Docalaizer)
+
+External application backends (such as **Apogeus** and **Docalaizer**) NEVER access LocuGard's SQLite database or `auth_pepper.key`. Instead, each service is configured with its own 256-bit bearer secret in `create_web_app(..., service_tokens={"apogeus": {"token": "...", "audiences": ["apogeus"]}, "docalaizer": {"token": "...", "audiences": ["docalaizer"]}})`.
+
+### 1. Token Introspection & Audience Isolation
+
+- **`POST /api/service/introspect`**
+  - Header: `Authorization: Bearer <service_token>`
+  - Request: `{"token": "<user_access_token>", "audience": "apogeus", "peer_ip": "192.168.10.42", "touch_activity": true}`
+  - Response `200` (valid):
+    ```json
+    {
+      "active": true,
+      "account_id": "acc_...",
+      "display_name": "Dima",
+      "role": "owner",
+      "device_id": "dev_...",
+      "session_id": "sess_...",
+      "audience": "apogeus",
+      "effective_mode": 2,
+      "network_zone": "lan",
+      "access_expires_at": 1764000600.0,
+      "session_expires_at": 1764604800.0,
+      "idle_expires_at": 1764043200.0,
+      "policy_version": 1
+    }
+    ```
+  - Response `200` (revoked / expired / wrong service): `{"active": false, "reason": "session_invalid_or_revoked | access_token_expired | audience_mismatch | ..."}`.
+  - **Multi-service isolation:** a token issued with `audience="apogeus"` is strictly rejected when Docalaizer introspects it (`active: false, reason: "audience_mismatch"`). Each app obtains its own audience-scoped session using the same underlying account and device key.
+
+### 2. Real-Time Revocation Stream (Open WebSockets) & Max Latency
+
+- **Push stream (SSE):** `GET /api/service/events?since_seq=<last_seq>` (`Authorization: Bearer <service_token>`).
+  - Emits `event: revocation` with `data: {"seq", "event_type", "account_id", "device_id", "session_id", "audience", "reason", "occurred_at"}` immediately upon SQLite commit (`device_revoked`, `session_closed`, `account_sessions_revoked`, `account_suspended`, `refresh_reuse_detected`).
+  - Apogeus keeps one persistent HTTPS SSE connection and closes any open WebSocket whose `device_id` / `session_id` / `account_id` matches the event.
+- **Catch-up / polling fallback:** `GET /api/service/revocations?since_seq=<last_seq>&limit=100` → `{"events": [...], "last_seq": N}`.
+- **Documented maximum revocation latency:**
+  - **Normal operation (SSE connected):** **≤ 1 second** (pushed immediately upon commit).
+  - **Degraded operation (SSE temporarily disconnected):** **≤ 30 seconds** (recommended periodic re-introspect / catch-up poll interval on active WebSockets; hard ceiling **600 s** at `access_token` expiry).
 
 ---
 

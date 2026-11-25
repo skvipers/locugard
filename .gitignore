@@ -21,6 +21,7 @@ data/
 backups/
 
 # Local experiments, pilot data & internal root project notes
+/.preview/
 /pilot/
 /spike/
 /AGENTS.md
