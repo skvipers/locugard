@@ -265,10 +265,16 @@ class AuthService:
                 "INSERT INTO challenges (challenge_id, purpose, challenge_bytes, origin, rp_id, issued_at, expires_at, state) VALUES (?, 'bootstrap_owner', ?, ?, ?, ?, ?, 'issued')",
                 (chal_id, chal_bytes, self.expected_origin, self.rp_id, now, now + REG_CHALLENGE_TTL_S),
             )
+        from webauthn.helpers.structs import ResidentKeyRequirement
+
         opts = webauthn.generate_registration_options(
             rp_id=self.rp_id, rp_name=self.rp_name, user_id=f"boot_{chal_id}".encode(),
             user_name=display_name, challenge=chal_bytes,
-            authenticator_selection=AuthSel(user_verification=UVReq.REQUIRED),
+            authenticator_selection=AuthSel(
+                resident_key=ResidentKeyRequirement.REQUIRED,
+                require_resident_key=True,
+                user_verification=UVReq.REQUIRED,
+            ),
         )
         return {"challenge_id": chal_id, "options": json.loads(webauthn.options_to_json(opts))}
 
@@ -666,7 +672,20 @@ class AuthService:
         if err is not None:
             self.store.audit("registration_begin_denied", "denied", reason_code=err.code, extra={"enrollment_id": enrollment_id})
             raise err
-        opts = webauthn.generate_registration_options(rp_id=self.rp_id, rp_name=self.rp_name, user_id=target_row["account_id"].encode(), user_name=target_row["display_name"], challenge=chal_bytes, authenticator_selection=AuthSel(user_verification=UVReq.REQUIRED))
+        from webauthn.helpers.structs import ResidentKeyRequirement
+
+        opts = webauthn.generate_registration_options(
+            rp_id=self.rp_id,
+            rp_name=self.rp_name,
+            user_id=target_row["account_id"].encode(),
+            user_name=target_row["display_name"],
+            challenge=chal_bytes,
+            authenticator_selection=AuthSel(
+                resident_key=ResidentKeyRequirement.REQUIRED,
+                require_resident_key=True,
+                user_verification=UVReq.REQUIRED,
+            ),
+        )
         return {"challenge_id": chal_id, "allowed_role": allowed_role, "options": json.loads(webauthn.options_to_json(opts))}
 
     def submit_registration(

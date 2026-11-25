@@ -1036,7 +1036,7 @@ BOOTSTRAP_UI_HTML = """<!doctype html>
             rp: { name: "LocuGard", id: location.hostname },
             user: { id: new TextEncoder().encode("owner_bootstrap"), name, displayName: name },
             pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
-            authenticatorSelection: { userVerification: "required" },
+            authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
             timeout: 60000
           }
         });
