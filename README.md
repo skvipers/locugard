@@ -4,7 +4,7 @@
 
 LocuGard fills the gap between *"no auth because it's on my LAN"* and heavy enterprise identity providers (Keycloak, Authentik). It embeds cleanly into any Python 3.11+ service with a single SQLite database, **zero core dependencies**, and an optional Starlette/WebAuthn HTTPS layer.
 
-> **Status (`v0.2.0`):** Built-in optional Web UI (`include_ui=True`), native client HTTPS API (`/auth/app/*` for Flutter/Windows/Android), and service-to-service introspection & real-time SSE revocation stream (`/api/service/*` for Apogeus/Docalaizer). Internally red-team audited with automated integration tests covering all threat scenarios, but not yet externally audited by a third-party firm. See [SECURITY.md](SECURITY.md).
+> **Status (`v0.3.0`):** Built-in EN/RU Web UI (`include_ui=True`, `/`, `/bootstrap`, `/enroll`, `/pair`), browser-assisted native Device Pairing (`/auth/app/pair/*` for Flutter Windows/Android), centralized Browser SSO with PKCE S256 (`/sso/authorize` + `/api/service/sso/token` for Docalaizer & internal web apps), native HTTPS API (`/auth/app/*`), and service introspection + real-time SSE revocation (`/api/service/*`). Internally red-team audited with automated integration tests covering all threat scenarios, but not yet externally audited by a third-party firm. See [SECURITY.md](SECURITY.md).
 
 ---
 

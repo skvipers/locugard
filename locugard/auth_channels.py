@@ -1,6 +1,9 @@
 """Канальные и расширенные протоколы LocuGard: P2/P7, P4, P6, P10 (усилено по итогам L4-аудита)."""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import re
 import secrets
@@ -26,7 +29,27 @@ ACCESS_TOKEN_TTL_S = 600
 TG_LINK_TTL_S = 300
 TG_CALLBACK_TTL_S = 300
 RECOVERY_REQ_TTL_S = 600
+PAIRING_TTL_S = 300
+PAIRING_MAX_PENDING = 10
+PAIRING_MAX_CODE_FAILS = 5
+SSO_CODE_TTL_S = 60
 _AUDIENCE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
+_PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+_USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def _gen_user_code() -> str:
+    raw = "".join(secrets.choice(_USER_CODE_ALPHABET) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def _norm_user_code(val: str | None) -> str:
+    return re.sub(r"[\s-]+", "", (val or "").strip().upper())
+
+
+def _pkce_s256(verifier: str) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
 
 
 def _validate_audience(audience: str | None) -> str:
@@ -963,3 +986,425 @@ class AuthChannels:
         self.store.audit("console_recovery_completed", "ok", account_id=account_id, device_id=dev_id, network_zone="local_console", policy_version=policy["policy_version"], extra={"key_fingerprint": fp})
         self.store.notify("recovery_completed", [account_id], {"basis": "local_console", "new_device_id": dev_id, "key_fingerprint": fp})
         return {"recovery_request_id": rreq_id, "device_id": dev_id, "credential_id": cred_id, "key_fingerprint": fp}
+
+    # =========================================================================
+    # Device Pairing (Apogeus / Flutter Windows & Android — PoP + SAS + Polling)
+    # =========================================================================
+
+    def app_pair_start(
+        self,
+        *,
+        device_name: str,
+        hardware_binding: bool = False,
+        source_key: str = "unknown",
+    ) -> dict[str, Any]:
+        """Шаг 1 Device Pairing: клиент запрашивает pair_id, poll_secret, PoP challenge и SAS user_code."""
+        if not self.auth.rl.allow(f"pair_start:{source_key}", 10, 3600):
+            raise AuthError("rate_limited", status_code=429)
+        policy = self.store.get_server_policy()
+        if not MODE_DEFAULTS[policy["min_mode"]]["new_device_access"]:
+            raise AuthError("new_devices_forbidden_in_mode_4", status_code=403)
+        if MODE_DEFAULTS[policy["min_mode"]]["hardware_key_required"] and not hardware_binding:
+            raise AuthError("hardware_key_required", status_code=403)
+
+        now = time.time()
+        pair_id = f"pair_{secrets.token_hex(10)}"
+        poll_secret = secrets.token_urlsafe(32)
+        chal_bytes = secrets.token_bytes(32)
+        user_code = _gen_user_code()
+        expires_at = now + PAIRING_TTL_S
+        clean_name = (device_name or "Native Device").strip()[:80] or "Native Device"
+
+        with self.store.transaction() as conn:
+            conn.execute(
+                "UPDATE app_pairing_sessions SET state = 'expired', resolved_at = ? WHERE state IN ('initiated', 'pending_approval') AND expires_at < ?",
+                (now, now),
+            )
+            active_cnt = conn.execute(
+                "SELECT COUNT(*) FROM app_pairing_sessions WHERE state IN ('initiated', 'pending_approval')"
+            ).fetchone()[0]
+            if active_cnt >= PAIRING_MAX_PENDING:
+                raise AuthError("too_many_pending_pairings", status_code=429)
+            conn.execute(
+                """
+                INSERT INTO app_pairing_sessions (
+                    pair_id, poll_secret_hash, user_code, failed_code_attempts, challenge_bytes, rp_id,
+                    device_name, hardware_binding, state, created_at, expires_at
+                ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, 'initiated', ?, ?)
+                """,
+                (
+                    pair_id, hash_secret(poll_secret, self.store.pepper), user_code,
+                    chal_bytes, self.auth.rp_id, clean_name, int(bool(hardware_binding)), now, expires_at,
+                ),
+            )
+        self.store.audit("app_pairing_started", "ok", extra={"pair_id": pair_id, "device_name": clean_name})
+        return {
+            "pair_id": pair_id,
+            "poll_secret": poll_secret,
+            "challenge_hex": chal_bytes.hex(),
+            "rp_id": self.auth.rp_id,
+            "user_code": user_code,
+            "verification_url": f"{self.auth.expected_origin}/pair?id={pair_id}",
+            "expires_at": expires_at,
+        }
+
+    def app_pair_submit_key(
+        self,
+        *,
+        pair_id: str,
+        poll_secret: str,
+        public_key_pem: bytes,
+        signature: bytes,
+    ) -> dict[str, Any]:
+        """Шаг 2 Device Pairing: клиент подтверждает владение ключом (PoP ECDSA P-256) и переводит заявку в pending_approval."""
+        now = time.time()
+        err: AuthError | None = None
+        out: dict[str, Any] = {}
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT * FROM app_pairing_sessions WHERE pair_id = ?", (pair_id,)).fetchone()
+            if not row or not hmac.compare_digest(row["poll_secret_hash"], hash_secret(poll_secret, self.store.pepper)):
+                err = AuthError("pairing_invalid", status_code=401)
+            elif row["state"] != "initiated":
+                err = AuthError(f"pairing_{row['state']}", status_code=409)
+            elif now > row["expires_at"]:
+                conn.execute("UPDATE app_pairing_sessions SET state = 'expired', resolved_at = ? WHERE pair_id = ?", (now, pair_id))
+                err = AuthError("pairing_expired", status_code=410)
+            else:
+                domain_msg = f"locugard:app_pair:{row['rp_id']}:{pair_id}:".encode() + row["challenge_bytes"]
+                try:
+                    _verify_ecdsa_p256(public_key_pem, domain_msg, signature)
+                except Exception:
+                    conn.execute("UPDATE app_pairing_sessions SET state = 'rejected', resolved_at = ? WHERE pair_id = ?", (now, pair_id))
+                    err = AuthError("invalid_signature", status_code=401)
+                else:
+                    fp = key_fingerprint(public_key_pem)
+                    conn.execute(
+                        "UPDATE app_pairing_sessions SET public_key = ?, key_fingerprint = ?, state = 'pending_approval' WHERE pair_id = ?",
+                        (public_key_pem, fp, pair_id),
+                    )
+                    out = {
+                        "pair_id": pair_id,
+                        "key_fingerprint": fp,
+                        "user_code": row["user_code"],
+                        "verification_url": f"{self.auth.expected_origin}/pair?id={pair_id}",
+                        "status": "pending_approval",
+                        "expires_at": row["expires_at"],
+                    }
+        if err is not None:
+            self.store.audit("app_pairing_key_denied", "denied", reason_code=err.code, extra={"pair_id": pair_id})
+            raise err
+        self.store.audit("app_pairing_key_submitted", "ok", extra={"pair_id": pair_id, "key_fingerprint": out["key_fingerprint"]})
+        return out
+
+    def app_pair_status(self, *, pair_id: str, poll_secret: str) -> dict[str, Any]:
+        """Polling-статус Device Pairing для нативного клиента (без 127.0.0.1 callback)."""
+        if not self.auth.rl.allow(f"pair_poll:{pair_id}", 60, 60):
+            raise AuthError("rate_limited", status_code=429)
+        now = time.time()
+        err: AuthError | None = None
+        out: dict[str, Any] = {}
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT * FROM app_pairing_sessions WHERE pair_id = ?", (pair_id,)).fetchone()
+            if not row or not hmac.compare_digest(row["poll_secret_hash"], hash_secret(poll_secret, self.store.pepper)):
+                err = AuthError("pairing_invalid", status_code=401)
+            elif row["state"] in ("initiated", "pending_approval") and now > row["expires_at"]:
+                conn.execute("UPDATE app_pairing_sessions SET state = 'expired', resolved_at = ? WHERE pair_id = ?", (now, pair_id))
+                out = {"status": "expired"}
+            elif row["state"] == "approved":
+                acc = conn.execute("SELECT role FROM accounts WHERE account_id = ?", (row["target_account_id"],)).fetchone()
+                out = {
+                    "status": "approved",
+                    "device_id": row["device_id"],
+                    "credential_id": row["credential_id"],
+                    "account_id": row["target_account_id"],
+                    "role": acc["role"] if acc else "",
+                    "key_fingerprint": row["key_fingerprint"],
+                }
+            else:
+                out = {"status": row["state"], "expires_at": row["expires_at"]}
+        if err is not None:
+            raise err
+        return out
+
+    def app_pair_inspect(self, ctx: VerifiedContext, *, pair_id: str) -> dict[str, Any]:
+        """Безопасный просмотр заявки pairing для owner (НЕ раскрывает user_code и poll_secret)."""
+        if ctx.role != "owner":
+            raise AuthError("owner_required", status_code=403)
+        now = time.time()
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT * FROM app_pairing_sessions WHERE pair_id = ?", (pair_id,)).fetchone()
+            if not row:
+                raise AuthError("pairing_not_found", status_code=404)
+            state = row["state"]
+            if state in ("initiated", "pending_approval") and now > row["expires_at"]:
+                conn.execute("UPDATE app_pairing_sessions SET state = 'expired', resolved_at = ? WHERE pair_id = ?", (now, pair_id))
+                state = "expired"
+            return {
+                "pair_id": row["pair_id"],
+                "device_name": row["device_name"],
+                "hardware_binding": bool(row["hardware_binding"]),
+                "key_fingerprint": row["key_fingerprint"],
+                "state": state,
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+            }
+
+    def app_pair_approve(
+        self,
+        ctx: VerifiedContext,
+        *,
+        pair_id: str,
+        user_code: str,
+        target_account_id: str | None = None,
+        second_verification_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Одобрение Device Pairing владельцем после сверки SAS user_code и свежей проверки Passkey."""
+        if ctx.role != "owner":
+            raise AuthError("owner_required", status_code=403)
+        if not self.auth.is_fresh(ctx):
+            raise AuthError("fresh_verification_required", status_code=403)
+        now = time.time()
+        policy = self.store.get_server_policy()
+        err: AuthError | None = None
+        out: dict[str, Any] = {}
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT * FROM app_pairing_sessions WHERE pair_id = ?", (pair_id,)).fetchone()
+            if not row:
+                err = AuthError("pairing_not_found", status_code=404)
+            elif row["state"] != "pending_approval":
+                err = AuthError(f"pairing_{row['state']}", status_code=409)
+            elif now > row["expires_at"]:
+                conn.execute("UPDATE app_pairing_sessions SET state = 'expired', resolved_at = ? WHERE pair_id = ?", (now, pair_id))
+                err = AuthError("pairing_expired", status_code=410)
+            elif not hmac.compare_digest(_norm_user_code(row["user_code"]), _norm_user_code(user_code)):
+                fails = int(row["failed_code_attempts"]) + 1
+                if fails >= PAIRING_MAX_CODE_FAILS:
+                    conn.execute("UPDATE app_pairing_sessions SET failed_code_attempts = ?, state = 'rejected', resolved_at = ? WHERE pair_id = ?", (fails, now, pair_id))
+                else:
+                    conn.execute("UPDATE app_pairing_sessions SET failed_code_attempts = ? WHERE pair_id = ?", (fails, pair_id))
+                err = AuthError("invalid_user_code", status_code=403)
+            else:
+                tgt_id = (target_account_id or ctx.account_id).strip()
+                actor = conn.execute("SELECT * FROM accounts WHERE account_id = ? AND state = 'active' AND role = 'owner'", (ctx.account_id,)).fetchone()
+                target = conn.execute("SELECT * FROM accounts WHERE account_id = ? AND state = 'active'", (tgt_id,)).fetchone()
+                if not actor or not target:
+                    err = AuthError("target_account_invalid", status_code=404)
+                else:
+                    eff = self.auth.compute_effective_mode(
+                        policy, actor_min_mode=actor["min_mode"], target_min_mode=target["min_mode"], action_min_mode=2, network_zone=ctx.network_zone,
+                    )
+                    mcfg = MODE_DEFAULTS[eff]
+                    if not mcfg["new_device_access"]:
+                        err = AuthError("new_devices_forbidden_in_mode_4", status_code=403)
+                    elif mcfg["hardware_key_required"] and not row["hardware_binding"]:
+                        err = AuthError("hardware_key_required", status_code=403)
+                    else:
+                        if eff >= 3:
+                            self.auth.verify_independent_second_approval_conn(
+                                conn, ctx, second_verification_id, consume_op_id=pair_id, require_owner=True, effective_mode=eff,
+                            )
+                        self.auth.consume_primary_verification_mode4_conn(conn, ctx, pair_id, effective_mode=eff)
+                        dev_id = f"dev_{secrets.token_hex(8)}"
+                        cred_id = f"cred_{secrets.token_hex(8)}"
+                        hw = bool(row["hardware_binding"])
+                        conn.execute(
+                            "INSERT INTO devices (device_id, account_id, display_name, kind, state, attestation_level, hardware_binding, created_at, activated_at) VALUES (?, ?, ?, 'app_install', 'active', ?, ?, ?, ?)",
+                            (dev_id, target["account_id"], row["device_name"], "direct" if hw else "none", int(hw), now, now),
+                        )
+                        conn.execute(
+                            "INSERT INTO credentials (credential_id, device_id, account_id, external_credential_id, public_key, algorithm, key_type, key_fingerprint, user_verification, attestation_level, backup_state, state, created_at, activated_at) VALUES (?, ?, ?, ?, ?, 'ES256', 'os_keystore', ?, 1, ?, 'single_device', 'active', ?, ?)",
+                            (cred_id, dev_id, target["account_id"], f"app_{cred_id}", row["public_key"], row["key_fingerprint"], "direct" if hw else "none", now, now),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE app_pairing_sessions
+                            SET target_account_id = ?, device_id = ?, credential_id = ?, approved_by_account_id = ?,
+                                approval_verification_id = ?, second_approval_id = ?, state = 'approved', resolved_at = ?
+                            WHERE pair_id = ?
+                            """,
+                            (target["account_id"], dev_id, cred_id, ctx.account_id, ctx.identity_verification_id, second_verification_id, now, pair_id),
+                        )
+                        out = {
+                            "pair_id": pair_id,
+                            "device_id": dev_id,
+                            "credential_id": cred_id,
+                            "account_id": target["account_id"],
+                            "role": target["role"],
+                            "key_fingerprint": row["key_fingerprint"],
+                            "status": "approved",
+                        }
+        if err is not None:
+            self.store.audit("app_pairing_approve_denied", "denied", reason_code=err.code, account_id=ctx.account_id, device_id=ctx.device_id, session_id=ctx.session_id, extra={"pair_id": pair_id})
+            raise err
+        self.store.audit("app_pairing_approved", "ok", account_id=out["account_id"], device_id=out["device_id"], credential_id=out["credential_id"], session_id=ctx.session_id, network_zone=ctx.network_zone, extra={"pair_id": pair_id, "approved_by": ctx.account_id, "key_fingerprint": out["key_fingerprint"]})
+        return out
+
+    def app_pair_reject(self, ctx: VerifiedContext, *, pair_id: str) -> dict[str, Any]:
+        if ctx.role != "owner":
+            raise AuthError("owner_required", status_code=403)
+        now = time.time()
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT state FROM app_pairing_sessions WHERE pair_id = ?", (pair_id,)).fetchone()
+            if not row:
+                raise AuthError("pairing_not_found", status_code=404)
+            if row["state"] in ("initiated", "pending_approval"):
+                conn.execute("UPDATE app_pairing_sessions SET state = 'rejected', resolved_at = ? WHERE pair_id = ?", (now, pair_id))
+        self.store.audit("app_pairing_rejected", "ok", account_id=ctx.account_id, device_id=ctx.device_id, session_id=ctx.session_id, extra={"pair_id": pair_id})
+        return {"pair_id": pair_id, "status": "rejected"}
+
+    # =========================================================================
+    # Browser SSO (Authorization Code + PKCE S256 для Docalaizer и веб-сервисов)
+    # =========================================================================
+
+    def sso_issue_code(
+        self,
+        ctx: VerifiedContext,
+        *,
+        client_id: str,
+        audience: str,
+        redirect_uri: str,
+        code_challenge: str,
+        code_challenge_method: str = "S256",
+        state_param: str | None = None,
+    ) -> dict[str, Any]:
+        """Выпуск одноразового 60-секундного SSO-кода (PKCE S256) после подтверждения в браузере на LocuGard."""
+        aud = _validate_audience(audience)
+        if code_challenge_method != "S256" or not _PKCE_CHALLENGE_RE.match(code_challenge or ""):
+            raise AuthError("invalid_pkce_challenge", status_code=400)
+        if not self.auth.rl.allow(f"sso_issue:{ctx.account_id}", 30, 300):
+            raise AuthError("rate_limited", status_code=429)
+        now = time.time()
+        policy = self.store.get_server_policy()
+        raw_code = secrets.token_urlsafe(32)
+        code_id = f"ssoc_{secrets.token_hex(8)}"
+        expires_at = now + SSO_CODE_TTL_S
+
+        with self.store.transaction() as conn:
+            acc = conn.execute("SELECT * FROM accounts WHERE account_id = ? AND state = 'active'", (ctx.account_id,)).fetchone()
+            dev = conn.execute("SELECT * FROM devices WHERE device_id = ? AND state = 'active'", (ctx.device_id,)).fetchone()
+            cred = conn.execute("SELECT * FROM credentials WHERE credential_id = ? AND state = 'active'", (ctx.credential_id,)).fetchone()
+            sess = conn.execute("SELECT * FROM sessions WHERE session_id = ? AND state = 'active'", (ctx.session_id,)).fetchone()
+            if not acc or not dev or not cred or not sess:
+                raise AuthError("context_revoked_or_inactive", status_code=401)
+            eff = self.auth.compute_effective_mode(policy, actor_min_mode=acc["min_mode"], action_min_mode=2, network_zone=ctx.network_zone)
+            mcfg = MODE_DEFAULTS[eff]
+            if acc["role"] not in mcfg["allowed_roles"]:
+                raise AuthError("role_forbidden_in_mode", status_code=403)
+            if mcfg["hardware_key_required"] and not dev["hardware_binding"]:
+                raise AuthError("hardware_key_required", status_code=403)
+            conn.execute(
+                """
+                INSERT INTO sso_auth_codes (
+                    code_id, code_hash, client_id, audience, redirect_uri, code_challenge, code_challenge_method,
+                    state_param, account_id, device_id, credential_id, source_session_id, identity_verification_id,
+                    network_zone, mode_at_issue, issued_at, expires_at, state
+                ) VALUES (?, ?, ?, ?, ?, ?, 'S256', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued')
+                """,
+                (
+                    code_id, hash_secret(raw_code, self.store.pepper), client_id, aud, redirect_uri, code_challenge,
+                    state_param, ctx.account_id, ctx.device_id, ctx.credential_id, ctx.session_id,
+                    ctx.identity_verification_id, ctx.network_zone, eff, now, expires_at,
+                ),
+            )
+        self.store.audit("sso_code_issued", "ok", account_id=ctx.account_id, device_id=ctx.device_id, session_id=ctx.session_id, network_zone=ctx.network_zone, extra={"client_id": client_id, "audience": aud, "code_id": code_id})
+        return {"code": raw_code, "code_id": code_id, "expires_at": expires_at}
+
+    def sso_exchange_code(
+        self,
+        *,
+        client_id: str,
+        allowed_audiences: set[str],
+        code: str,
+        redirect_uri: str,
+        code_verifier: str,
+        peer_ip: str | None = None,
+        forwarded_for: str | None = None,
+    ) -> dict[str, Any]:
+        """Серверный обмен одноразового SSO-кода + PKCE verifier на сессию/токены с привязкой к audience."""
+        if not code or not _PKCE_VERIFIER_RE.match(code_verifier or ""):
+            raise AuthError("invalid_grant", status_code=400)
+        now = time.time()
+        policy = self.store.get_server_policy()
+        code_hash = hash_secret(code, self.store.pepper)
+        err: AuthError | None = None
+        out: dict[str, Any] = {}
+
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT * FROM sso_auth_codes WHERE code_hash = ?", (code_hash,)).fetchone()
+            if not row or row["state"] != "issued":
+                err = AuthError("invalid_grant", status_code=401)
+            elif now > row["expires_at"]:
+                conn.execute("UPDATE sso_auth_codes SET state = 'expired' WHERE code_id = ?", (row["code_id"],))
+                err = AuthError("code_expired", status_code=401)
+            elif row["client_id"] != client_id or row["audience"] not in allowed_audiences or row["redirect_uri"] != redirect_uri:
+                conn.execute("UPDATE sso_auth_codes SET state = 'revoked' WHERE code_id = ?", (row["code_id"],))
+                err = AuthError("invalid_grant", status_code=401)
+            elif not hmac.compare_digest(_pkce_s256(code_verifier), row["code_challenge"]):
+                conn.execute("UPDATE sso_auth_codes SET state = 'revoked' WHERE code_id = ?", (row["code_id"],))
+                err = AuthError("pkce_verification_failed", status_code=401)
+            else:
+                acc = conn.execute("SELECT * FROM accounts WHERE account_id = ? AND state = 'active'", (row["account_id"],)).fetchone()
+                dev = conn.execute("SELECT * FROM devices WHERE device_id = ? AND state = 'active'", (row["device_id"],)).fetchone()
+                cred = conn.execute("SELECT * FROM credentials WHERE credential_id = ? AND state = 'active'", (row["credential_id"],)).fetchone()
+                src_sess = conn.execute("SELECT * FROM sessions WHERE session_id = ? AND state = 'active'", (row["source_session_id"],)).fetchone()
+                if not acc or not dev or not cred or not src_sess:
+                    conn.execute("UPDATE sso_auth_codes SET state = 'revoked' WHERE code_id = ?", (row["code_id"],))
+                    err = AuthError("context_revoked_or_inactive", status_code=401)
+                else:
+                    zone = row["network_zone"]
+                    if peer_ip:
+                        cur_zone = resolve_network_zone(peer_ip, policy["allowed_networks"], self.auth.trusted_proxies, forwarded_for)
+                        if cur_zone == "outside_lan":
+                            zone = "outside_lan"
+                    if zone == "outside_lan" and policy["outside_lan_behavior"] == "deny":
+                        conn.execute("UPDATE sso_auth_codes SET state = 'revoked' WHERE code_id = ?", (row["code_id"],))
+                        err = AuthError("outside_allowed_network", status_code=403)
+                    else:
+                        eff = self.auth.compute_effective_mode(policy, actor_min_mode=acc["min_mode"], action_min_mode=2, network_zone=zone)
+                        mcfg = MODE_DEFAULTS[eff]
+                        if acc["role"] not in mcfg["allowed_roles"]:
+                            conn.execute("UPDATE sso_auth_codes SET state = 'revoked' WHERE code_id = ?", (row["code_id"],))
+                            err = AuthError("role_forbidden_in_mode", status_code=403)
+                        elif mcfg["hardware_key_required"] and not dev["hardware_binding"]:
+                            conn.execute("UPDATE sso_auth_codes SET state = 'revoked' WHERE code_id = ?", (row["code_id"],))
+                            err = AuthError("hardware_key_required", status_code=403)
+                        else:
+                            sess_id, chain_id = f"sess_{secrets.token_hex(8)}", f"chn_{secrets.token_hex(8)}"
+                            access_token, refresh_token, csrf_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+                            abs_ttl = min(policy["session_ttl_s"], mcfg["session_ttl_s"])
+                            idle_ttl = min(policy["idle_ttl_s"], mcfg["idle_ttl_s"])
+                            abs_exp, idle_exp = now + abs_ttl, min(now + abs_ttl, now + idle_ttl)
+                            access_exp = min(abs_exp, now + ACCESS_TOKEN_TTL_S)
+                            conn.execute("UPDATE sso_auth_codes SET state = 'consumed', consumed_at = ? WHERE code_id = ?", (now, row["code_id"]))
+                            conn.execute(
+                                "INSERT INTO sessions (session_id, session_token_hash, csrf_token_hash, account_id, device_id, credential_id, auth_method, authenticated_at, identity_verification_id, created_at, last_activity_at, absolute_expires_at, idle_expires_at, access_token_expires_at, audience, network_zone_at_login, mode_at_login, state) VALUES (?, ?, ?, ?, ?, ?, 'sso_webauthn', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                                (sess_id, hash_secret(access_token, self.store.pepper), hash_secret(csrf_token, self.store.pepper), acc["account_id"], dev["device_id"], cred["credential_id"], now, row["identity_verification_id"], now, now, abs_exp, idle_exp, access_exp, row["audience"], zone, eff),
+                            )
+                            conn.execute(
+                                "INSERT INTO refresh_token_chains (chain_id, session_id, generation, current_token_hash, rotated_at, state) VALUES (?, ?, 1, ?, ?, 'active')",
+                                (chain_id, sess_id, hash_secret(refresh_token, self.store.pepper), now),
+                            )
+                            out = {
+                                "session_id": sess_id,
+                                "chain_id": chain_id,
+                                "audience": row["audience"],
+                                "account_id": acc["account_id"],
+                                "display_name": acc["display_name"],
+                                "role": acc["role"],
+                                "device_id": dev["device_id"],
+                                "access_token": access_token,
+                                "access_expires_in": ACCESS_TOKEN_TTL_S,
+                                "access_expires_at": access_exp,
+                                "refresh_token": refresh_token,
+                                "generation": 1,
+                                "session_expires_at": abs_exp,
+                                "idle_expires_at": idle_exp,
+                                "effective_mode": eff,
+                                "network_zone": zone,
+                                "policy_version": policy["policy_version"],
+                            }
+        if err is not None:
+            self.store.audit("sso_exchange_denied", "denied", reason_code=err.code, extra={"client_id": client_id})
+            raise err
+        self.store.audit("sso_token_issued", "ok", account_id=out["account_id"], device_id=out["device_id"], session_id=out["session_id"], network_zone=out["network_zone"], extra={"client_id": client_id, "audience": out["audience"]})
+        return out

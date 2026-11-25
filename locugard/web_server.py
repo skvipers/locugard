@@ -6,10 +6,12 @@ import hmac
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .auth_channels import AuthChannels
 from .auth_permissions import AuthPermissionsBridge
 from .auth_service import AuthError, AuthService, extract_client_ip
+from .web_flows_ui import render_pair_ui, render_sso_ui
 from .web_ui import render_bootstrap_ui, render_enroll_ui, render_web_ui, resolve_ui_lang
 
 SESSION_COOKIE = "__Host-locugard_sid"
@@ -56,12 +58,22 @@ def _normalize_service_tokens(service_tokens: dict[str, Any] | None) -> dict[str
         return out
     for svc_id, cfg in service_tokens.items():
         if isinstance(cfg, str) and cfg:
-            out[svc_id] = {"token": cfg, "audiences": {svc_id}}
+            out[svc_id] = {"token": cfg, "audiences": {svc_id}, "redirect_uris": set(), "display_name": svc_id}
         elif isinstance(cfg, dict) and isinstance(cfg.get("token"), str) and cfg["token"]:
             auds = cfg.get("audiences")
             aud_set = set(auds) if isinstance(auds, (list, tuple, set)) and auds else {svc_id}
-            out[svc_id] = {"token": cfg["token"], "audiences": aud_set}
+            ruris = cfg.get("redirect_uris")
+            ruri_set = {str(u).strip() for u in ruris if str(u).strip()} if isinstance(ruris, (list, tuple, set)) else set()
+            display_name = str(cfg.get("display_name") or svc_id)
+            out[svc_id] = {"token": cfg["token"], "audiences": aud_set, "redirect_uris": ruri_set, "display_name": display_name}
     return out
+
+
+def _append_query_params(url: str, extra: dict[str, str]) -> str:
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    q.update({k: v for k, v in extra.items() if v is not None and v != ""})
+    return urlunparse(parsed._replace(query=urlencode(q)))
 
 
 def create_web_app(
@@ -544,6 +556,166 @@ def create_web_app(
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
 
+    async def list_accounts_ep(req: Request) -> JSONResponse:
+        try:
+            ctx = auth.verify_session(req.cookies.get(SESSION_COOKIE), peer_ip=_peer_ip(req), forwarded_for=req.headers.get("x-forwarded-for"))
+            if ctx.role != "owner":
+                raise AuthError("owner_required", status_code=403)
+            return JSONResponse({"accounts": auth.store.list_accounts(active_only=True)})
+        except AuthError as e:
+            return _err(e)
+
+    # --- Device Pairing (Apogeus / Flutter Windows & Android — PoP + SAS + Polling) ---
+
+    async def app_pair_start_ep(req: Request) -> JSONResponse:
+        try:
+            body = await _json_obj(req)
+            return JSONResponse(ch.app_pair_start(
+                device_name=str(body.get("device_name", "Native Device")),
+                hardware_binding=bool(body.get("hardware_binding", False)),
+                source_key=_source_key(req),
+            ))
+        except AuthError as e:
+            return _err(e)
+
+    async def app_pair_submit_key_ep(req: Request) -> JSONResponse:
+        try:
+            body = await _json_obj(req)
+            pub_pem = body.get("public_key_pem")
+            if not isinstance(pub_pem, str) or "BEGIN PUBLIC KEY" not in pub_pem:
+                raise AuthError("invalid_payload", status_code=400)
+            sig = _decode_b64_signature(body.get("signature_b64"))
+            return JSONResponse(ch.app_pair_submit_key(
+                pair_id=str(body.get("pair_id", "")),
+                poll_secret=str(body.get("poll_secret", "")),
+                public_key_pem=pub_pem.encode("utf-8"),
+                signature=sig,
+            ))
+        except AuthError as e:
+            return _err(e)
+
+    async def app_pair_status_ep(req: Request) -> JSONResponse:
+        try:
+            body = await _json_obj(req)
+            return JSONResponse(ch.app_pair_status(
+                pair_id=str(body.get("pair_id", "")),
+                poll_secret=str(body.get("poll_secret", "")),
+            ))
+        except AuthError as e:
+            return _err(e)
+
+    async def pair_inspect_ep(req: Request) -> JSONResponse:
+        try:
+            ctx = auth.verify_session(req.cookies.get(SESSION_COOKIE), peer_ip=_peer_ip(req), forwarded_for=req.headers.get("x-forwarded-for"))
+            return JSONResponse(ch.app_pair_inspect(ctx, pair_id=req.path_params["pair_id"]))
+        except AuthError as e:
+            return _err(e)
+
+    async def pair_approve_ep(req: Request) -> JSONResponse:
+        try:
+            _check_origin(req)
+            ctx = auth.verify_session(req.cookies.get(SESSION_COOKIE), peer_ip=_peer_ip(req), forwarded_for=req.headers.get("x-forwarded-for"))
+            _verify_csrf_audited(ctx.session_id, req)
+            body = await _json_obj(req)
+            return JSONResponse(ch.app_pair_approve(
+                ctx,
+                pair_id=req.path_params["pair_id"],
+                user_code=str(body.get("user_code", "")),
+                target_account_id=body.get("target_account_id"),
+                second_verification_id=body.get("second_verification_id"),
+            ))
+        except AuthError as e:
+            return _err(e)
+
+    async def pair_reject_ep(req: Request) -> JSONResponse:
+        try:
+            _check_origin(req)
+            ctx = auth.verify_session(req.cookies.get(SESSION_COOKIE), peer_ip=_peer_ip(req), forwarded_for=req.headers.get("x-forwarded-for"))
+            _verify_csrf_audited(ctx.session_id, req)
+            return JSONResponse(ch.app_pair_reject(ctx, pair_id=req.path_params["pair_id"]))
+        except AuthError as e:
+            return _err(e)
+
+    # --- Browser SSO (Authorization Code + PKCE S256 для Docalaizer и веб-сервисов) ---
+
+    def _validate_sso_client(client_id: str, redirect_uri: str, code_challenge: str, method: str) -> dict[str, Any]:
+        cfg = svc_registry.get(client_id)
+        if not cfg or not cfg["redirect_uris"]:
+            raise AuthError("unknown_sso_client", status_code=400)
+        if redirect_uri not in cfg["redirect_uris"]:
+            auth.store.audit("sso_redirect_rejected", "denied", reason_code="invalid_redirect_uri", extra={"client_id": client_id})
+            raise AuthError("invalid_redirect_uri", status_code=400)
+        if method != "S256" or not code_challenge or len(code_challenge) < 43:
+            raise AuthError("invalid_pkce_challenge", status_code=400)
+        return cfg
+
+    async def sso_authorize_ep(req: Request) -> Response:
+        try:
+            client_id = str(req.query_params.get("client_id", "")).strip()
+            redirect_uri = str(req.query_params.get("redirect_uri", "")).strip()
+            code_challenge = str(req.query_params.get("code_challenge", "")).strip()
+            method = str(req.query_params.get("code_challenge_method", "S256")).strip()
+            state_param = str(req.query_params.get("state", "")).strip()
+            cfg = _validate_sso_client(client_id, redirect_uri, code_challenge, method)
+            lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
+            return HTMLResponse(render_sso_ui(
+                lang=lang,
+                client_id=client_id,
+                client_display_name=cfg["display_name"],
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                state_param=state_param,
+            ))
+        except AuthError as e:
+            return _err(e)
+
+    async def sso_approve_ep(req: Request) -> JSONResponse:
+        try:
+            _check_origin(req)
+            ctx = auth.verify_session(req.cookies.get(SESSION_COOKIE), peer_ip=_peer_ip(req), forwarded_for=req.headers.get("x-forwarded-for"))
+            _verify_csrf_audited(ctx.session_id, req)
+            body = await _json_obj(req)
+            client_id = str(body.get("client_id", "")).strip()
+            redirect_uri = str(body.get("redirect_uri", "")).strip()
+            code_challenge = str(body.get("code_challenge", "")).strip()
+            method = str(body.get("code_challenge_method", "S256")).strip()
+            state_param = str(body.get("state", "")).strip()
+            cfg = _validate_sso_client(client_id, redirect_uri, code_challenge, method)
+            audience = client_id if client_id in cfg["audiences"] else next(iter(cfg["audiences"]))
+            issued = ch.sso_issue_code(
+                ctx,
+                client_id=client_id,
+                audience=audience,
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                code_challenge_method=method,
+                state_param=state_param or None,
+            )
+            redirect_url = _append_query_params(redirect_uri, {"code": issued["code"], "state": state_param})
+            return JSONResponse({"redirect_url": redirect_url, "expires_at": issued["expires_at"]})
+        except AuthError as e:
+            return _err(e)
+
+    async def service_sso_token_ep(req: Request) -> JSONResponse:
+        try:
+            svc_id, allowed_auds = _authenticate_service(req)
+            body = await _json_obj(req)
+            return JSONResponse(ch.sso_exchange_code(
+                client_id=svc_id,
+                allowed_audiences=allowed_auds,
+                code=str(body.get("code", "")).strip(),
+                redirect_uri=str(body.get("redirect_uri", "")).strip(),
+                code_verifier=str(body.get("code_verifier", "")).strip(),
+                peer_ip=body.get("peer_ip") or _peer_ip(req),
+                forwarded_for=body.get("forwarded_for"),
+            ))
+        except AuthError as e:
+            return _err(e)
+
+    async def web_ui_pair(req: Request) -> HTMLResponse:
+        lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
+        return HTMLResponse(render_pair_ui(lang=lang))
+
     async def web_ui_index(req: Request) -> HTMLResponse:
         lang = resolve_ui_lang(req.query_params.get("lang"), req.headers.get("accept-language"))
         return HTMLResponse(render_web_ui(lang=lang))
@@ -575,9 +747,13 @@ def create_web_app(
         Route("/auth/reauth/options", reauth_options, methods=["POST"]),
         Route("/auth/reauth/verify", reauth_verify, methods=["POST"]),
         Route("/auth/logout", logout, methods=["POST"]),
+        Route("/api/accounts", list_accounts_ep, methods=["GET"]),
         Route("/api/devices", list_devices_ep, methods=["GET"]),
         Route("/api/devices/enrollment-codes", create_enrollment, methods=["POST"]),
         Route("/api/devices/registrations", list_registrations_ep, methods=["GET"]),
+        Route("/api/devices/pairings/{pair_id}", pair_inspect_ep, methods=["GET"]),
+        Route("/api/devices/pairings/{pair_id}/approve", pair_approve_ep, methods=["POST"]),
+        Route("/api/devices/pairings/{pair_id}/reject", pair_reject_ep, methods=["POST"]),
         Route("/auth/register/options", register_options, methods=["POST"]),
         Route("/auth/register/submit", register_submit, methods=["POST"]),
         Route("/api/devices/registrations/{request_id}/approve", approve_registration, methods=["POST"]),
@@ -589,11 +765,18 @@ def create_web_app(
         # Нативный клиент (Flutter Windows / Android)
         Route("/auth/app/register/options", app_register_options, methods=["POST"]),
         Route("/auth/app/register/submit", app_register_submit, methods=["POST"]),
+        Route("/auth/app/pair/start", app_pair_start_ep, methods=["POST"]),
+        Route("/auth/app/pair/submit-key", app_pair_submit_key_ep, methods=["POST"]),
+        Route("/auth/app/pair/status", app_pair_status_ep, methods=["POST"]),
         Route("/auth/app/login/options", app_login_options, methods=["POST"]),
         Route("/auth/app/login/verify", app_login_verify, methods=["POST"]),
         Route("/auth/app/refresh", app_refresh_ep, methods=["POST"]),
         Route("/auth/app/logout", app_logout_ep, methods=["POST"]),
+        # Browser SSO (Docalaizer и внутренние веб-сервисы)
+        Route("/sso/authorize", sso_authorize_ep, methods=["GET"]),
+        Route("/sso/approve", sso_approve_ep, methods=["POST"]),
         # Сервисный API (Apogeus, Docalaizer)
+        Route("/api/service/sso/token", service_sso_token_ep, methods=["POST"]),
         Route("/api/service/introspect", service_introspect, methods=["POST"]),
         Route("/api/service/revocations", service_revocations, methods=["GET"]),
         Route("/api/service/events", service_events_sse, methods=["GET"]),
@@ -601,6 +784,7 @@ def create_web_app(
     if include_ui:
         routes.insert(0, Route("/assets/{filename}", web_ui_asset, methods=["GET"]))
         routes.insert(0, Route("/favicon.ico", web_ui_asset, methods=["GET"]))
+        routes.insert(0, Route("/pair", web_ui_pair, methods=["GET"]))
         routes.insert(0, Route("/enroll", web_ui_enroll, methods=["GET"]))
         routes.insert(0, Route("/bootstrap", web_ui_bootstrap, methods=["GET"]))
         routes.insert(0, Route("/", web_ui_index, methods=["GET"]))

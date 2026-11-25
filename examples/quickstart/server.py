@@ -33,14 +33,28 @@ PORT = int(os.environ.get("LOCUGARD_PORT", "8443"))
 ORIGIN = os.environ.get("LOCUGARD_ORIGIN", f"https://{RP_ID}:{PORT}")
 
 
+def _split_csv_env(name: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
 def _load_service_tokens() -> dict[str, dict]:
     tokens: dict[str, dict] = {}
     apogeus_tok = os.environ.get("LOCUGARD_SERVICE_TOKEN_APOGEUS", "").strip()
     if apogeus_tok:
-        tokens["apogeus"] = {"token": apogeus_tok, "audiences": ["apogeus"]}
+        tokens["apogeus"] = {
+            "token": apogeus_tok,
+            "audiences": ["apogeus"],
+            "redirect_uris": _split_csv_env("LOCUGARD_SSO_REDIRECT_URIS_APOGEUS"),
+            "display_name": "Apogeus",
+        }
     docalaizer_tok = os.environ.get("LOCUGARD_SERVICE_TOKEN_DOCALAIZER", "").strip()
     if docalaizer_tok:
-        tokens["docalaizer"] = {"token": docalaizer_tok, "audiences": ["docalaizer"]}
+        tokens["docalaizer"] = {
+            "token": docalaizer_tok,
+            "audiences": ["docalaizer"],
+            "redirect_uris": _split_csv_env("LOCUGARD_SSO_REDIRECT_URIS_DOCALAIZER"),
+            "display_name": "Docalaizer",
+        }
     return tokens
 
 

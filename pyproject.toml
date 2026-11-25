@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "locugard"
-version = "0.2.3"
+version = "0.3.0"
 description = "Embeddable multi-level WebAuthn/passkey authentication, strictness policies, and action-approval guard for self-hosted Python apps and AI agents"
 readme = "README.md"
 license = { text = "MIT" }

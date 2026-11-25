@@ -220,6 +220,43 @@ External application backends (such as **Apogeus** and **Docalaizer**) NEVER acc
 
 ---
 
+## 3.3 Browser-Assisted Native Device Pairing (`v0.3.0` — Apogeus Flutter Windows / Android)
+
+Eliminates manual `enrollment_id` / PowerShell copy-paste while keeping full LocuGard invariants (OS-keystore ECDSA P-256 PoP, anti-phishing 8-char SAS `user_code`, fresh `owner` Passkey approval, Mode 3 second-approval & Mode 4 denial, and polling with zero `http://127.0.0.1` callback):
+
+1. **`POST /auth/app/pair/start`** (native app):
+   - Request: `{"device_name": "Apogeus-Windows", "hardware_binding": true}`
+   - Response `200`: `{"pair_id", "poll_secret", "challenge_hex", "rp_id", "user_code": "K7M2-9P4Q", "verification_url": "https://apogeus.home.arpa:8443/pair?id=pair_...", "expires_at"}` (TTL 5 min).
+2. Native app generates ECDSA P-256 keypair in OS keystore and signs `utf8("locugard:app_pair:{rp_id}:{pair_id}:") + bytes.fromhex(challenge_hex)`.
+3. **`POST /auth/app/pair/submit-key`** (native app):
+   - Request: `{"pair_id", "poll_secret", "public_key_pem", "signature_b64"}`
+   - Response `200`: `{"pair_id", "key_fingerprint", "user_code", "verification_url", "status": "pending_approval", "expires_at"}`.
+4. Native app opens `verification_url` in the system browser, displays `user_code` on its screen, and polls **`POST /auth/app/pair/status`** (`{"pair_id", "poll_secret"}`, every 1–2 s).
+5. Owner signs in with Passkey on `https://apogeus.home.arpa:8443/pair?id=...`, verifies `device_name` + `key_fingerprint`, enters `user_code`, picks target account, and clicks **Approve** (`POST /api/devices/pairings/{pair_id}/approve`).
+6. Polling returns `{"status": "approved", "device_id": "dev_...", "account_id": "acc_...", "role": "owner", "key_fingerprint": "..."}`. Native app saves `device_id` and immediately performs standard `POST /auth/app/login/options` → `POST /auth/app/login/verify` (`audience="apogeus"`).
+
+---
+
+## 3.4 Centralized Browser SSO (`v0.3.0` — Docalaizer & Internal Web Services)
+
+Keeps a **single `LOCUGARD_ORIGIN`** (`https://apogeus.home.arpa:8443`) for Passkey verification while authenticating multiple internal web apps (e.g., Docalaizer on `:3443`) via **OAuth 2.0 Authorization Code + PKCE S256 + Confidential Service Token**:
+
+1. **Configure registered callback URIs on LocuGard:**
+   ```powershell
+   $env:LOCUGARD_SERVICE_TOKEN_DOCALAIZER = "<256-bit-secret>"
+   $env:LOCUGARD_SSO_REDIRECT_URIS_DOCALAIZER = "https://apogeus.home.arpa:3443/auth/locugard/callback"
+   ```
+2. **Docalaizer initiates login:** generates `state` and PKCE `code_verifier` (43–128 chars) + `code_challenge = base64url(sha256(code_verifier))`, and redirects browser to:
+   `GET https://apogeus.home.arpa:8443/sso/authorize?client_id=docalaizer&redirect_uri=<encoded>&code_challenge=<S256>&code_challenge_method=S256&state=<state>`
+3. **User signs in with Passkey on `:8443` and clicks Continue** (`POST /sso/approve`) → LocuGard redirects back to `<redirect_uri>?code=<one_time_60s_code>&state=<state>`.
+4. **Docalaizer backend exchanges code (`POST /api/service/sso/token`):**
+   - Header: `Authorization: Bearer <LOCUGARD_SERVICE_TOKEN_DOCALAIZER>`
+   - Request: `{"code": "...", "redirect_uri": "https://apogeus.home.arpa:3443/auth/locugard/callback", "code_verifier": "..."}`
+   - Response `200`: `{"session_id", "audience": "docalaizer", "account_id", "display_name", "role", "device_id", "access_token", "access_expires_in": 600, "refresh_token", "generation": 1, "session_expires_at", "idle_expires_at", "effective_mode", "network_zone", "policy_version"}`.
+5. **Session & Revocation:** Docalaizer keeps tokens server-side behind its own `HttpOnly; Secure; SameSite=Lax` cookie, validates via `POST /api/service/introspect` (`audience="docalaizer"`), refreshes via `POST /auth/app/refresh`, and drops sessions immediately on `GET /api/service/events` (`device_revoked`).
+
+---
+
 ## 4. Embedding LocuGard in Your Own App
 
 ### Protecting Your Own Starlette / FastAPI Route

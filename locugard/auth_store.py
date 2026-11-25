@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS server_policy (
@@ -293,6 +293,51 @@ CREATE TABLE IF NOT EXISTS revocation_events (
     reason TEXT NOT NULL,
     occurred_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS app_pairing_sessions (
+    pair_id TEXT PRIMARY KEY,
+    poll_secret_hash TEXT NOT NULL UNIQUE,
+    user_code TEXT NOT NULL,
+    failed_code_attempts INTEGER NOT NULL DEFAULT 0,
+    challenge_bytes BLOB NOT NULL,
+    rp_id TEXT NOT NULL,
+    device_name TEXT NOT NULL,
+    public_key BLOB,
+    key_fingerprint TEXT,
+    hardware_binding INTEGER NOT NULL DEFAULT 0,
+    target_account_id TEXT REFERENCES accounts(account_id),
+    device_id TEXT REFERENCES devices(device_id),
+    credential_id TEXT REFERENCES credentials(credential_id),
+    approved_by_account_id TEXT REFERENCES accounts(account_id),
+    approval_verification_id TEXT REFERENCES identity_verifications(verification_id),
+    second_approval_id TEXT REFERENCES identity_verifications(verification_id),
+    state TEXT NOT NULL CHECK (state IN ('initiated', 'pending_approval', 'approved', 'rejected', 'expired')),
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    resolved_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS sso_auth_codes (
+    code_id TEXT PRIMARY KEY,
+    code_hash TEXT NOT NULL UNIQUE,
+    client_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    code_challenge_method TEXT NOT NULL CHECK (code_challenge_method = 'S256'),
+    state_param TEXT,
+    account_id TEXT NOT NULL REFERENCES accounts(account_id),
+    device_id TEXT NOT NULL REFERENCES devices(device_id),
+    credential_id TEXT NOT NULL REFERENCES credentials(credential_id),
+    source_session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    identity_verification_id TEXT NOT NULL REFERENCES identity_verifications(verification_id),
+    network_zone TEXT NOT NULL,
+    mode_at_issue INTEGER NOT NULL,
+    issued_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('issued', 'consumed', 'expired', 'revoked')),
+    consumed_at REAL
+);
 """
 
 
@@ -557,6 +602,14 @@ class AuthStore:
             row = conn.execute("SELECT * FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
             return dict(row) if row else None
 
+    def list_accounts(self, *, active_only: bool = True) -> list[dict[str, Any]]:
+        with self.readonly() as conn:
+            sql = "SELECT account_id, display_name, role, state, min_mode FROM accounts"
+            if active_only:
+                sql += " WHERE state = 'active'"
+            sql += " ORDER BY created_at ASC"
+            return [dict(r) for r in conn.execute(sql).fetchall()]
+
     def list_devices(self, account_id: str | None = None) -> list[dict[str, Any]]:
         with self.readonly() as conn:
             if account_id:
@@ -780,6 +833,10 @@ class AuthStore:
                   )
                 """,
                 (now, reason, device_id, device_id),
+            )
+            conn.execute(
+                "UPDATE sso_auth_codes SET state = 'revoked' WHERE device_id = ? AND state = 'issued'",
+                (device_id,),
             )
             self.record_revocation_event_conn(
                 conn, "device_revoked", reason=reason, account_id=account_id, device_id=device_id, occurred_at=now,
